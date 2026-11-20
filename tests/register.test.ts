@@ -91,6 +91,8 @@ function world(
     isPipeAtCopy?: boolean;
     // While this says so `rm` fails, and removes nothing.
     rm?: { isFailing: boolean };
+    // `sips` is not on the PATH, as on Linux.
+    isSipsMissing?: boolean;
     // The files removed since the test began: nothing finds or converts one.
     gone?: Set<string>;
     // Looking at this path waits at this gate.
@@ -215,6 +217,19 @@ function world(
     };
   });
   on("process.run", async (_$, e) => {
+    // The probe for `sips` at the session's start is not a run under test.
+    if (e.argv.join(" ") === "/bin/sh -c command -v sips") {
+      const exitCode = extra.isSipsMissing === true ? 1 : 0;
+      return {
+        value: {
+          exitCode,
+          stdout: exitCode === 0 ? "/usr/bin/sips\n" : "",
+          stderr: "",
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
+    }
     runs.push([...e.argv]);
     timeouts.push(e.init?.timeoutMs);
     const tool = e.argv[0];
@@ -729,6 +744,19 @@ test("draws a chip under a reply that names an image file, with its picture in a
   expect(
     await ui.find({ type: "Text", text: /^shot\.png · 200×100 +$/ }),
   ).toBeDefined();
+});
+
+test("draws a chip with no card where sips is missing, and runs nothing for it", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" }, {}, true, undefined, {
+    isSipsMissing: true,
+  });
+  await start($);
+
+  const ui = await reply($, "Saved the chart to `shot.png`.");
+  const chips = await ui.findAll({ type: "Button" });
+  expect(chips.map((chip) => chip.props.label)).toEqual(["▣ shot.png"]);
+  expect(await cards(ui)).toHaveLength(0);
+  expect(runs).toHaveLength(0);
 });
 
 test("leaves a reply as the engine drew it when it names no image that exists", async ($, on) => {

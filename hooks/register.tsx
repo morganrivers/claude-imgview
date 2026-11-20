@@ -111,10 +111,16 @@ type Frame = {
 
 /**
  * A file a path leads to: where it landed and when it last changed. One
- * outside the working directory gets a chip to click and no card: nothing of
- * it is converted before the person asks.
+ * outside the working directory, or any file where `sips` is missing, gets a
+ * chip to click and no card: nothing of it is converted before the person
+ * asks.
  */
-type Located = { path: string; mtimeMs: number; isOutside?: true };
+type Located = {
+  path: string;
+  mtimeMs: number;
+  isOutside?: true;
+  hasNoCard?: true;
+};
 
 /**
  * A hover card's picture, measured and converted: cells, or on a terminal
@@ -213,6 +219,11 @@ type Host = {
    * themselves: not through tmux, and not across ssh.
    */
   isPixelTerminal: boolean;
+  /**
+   * Whether `sips` is on the PATH. Cards are made by `sips` alone, so without
+   * it (Linux) every chip is drawn with no card, as for a file outside.
+   */
+  canPreview: boolean;
 };
 
 async function measure(
@@ -313,7 +324,14 @@ async function locateMention(
   // A link named like a picture is taken by the name of what it leads to.
   if (!hasImageSuffix(found.realPath)) return undefined;
   if (!isInside(found.realPath, host.root))
-    return { path: found.realPath, mtimeMs: found.mtimeMs, isOutside: true };
+    return {
+      path: found.realPath,
+      mtimeMs: found.mtimeMs,
+      isOutside: true,
+      hasNoCard: true,
+    };
+  if (!host.canPreview)
+    return { path: found.realPath, mtimeMs: found.mtimeMs, hasNoCard: true };
   if (found.size > PREVIEW_MAX_BYTES) return undefined;
 
   return { path: found.realPath, mtimeMs: found.mtimeMs };
@@ -883,7 +901,15 @@ export const register: Register = (on) => {
           (await $.env.get("TERM")) === "xterm-ghostty" ||
           (await $.env.get("TERM_PROGRAM"))?.toLowerCase() === "ghostty" ||
           (await $.env.get("KITTY_WINDOW_ID")) !== undefined),
+      canPreview:
+        (await run(["/bin/sh", "-c", "command -v sips"]))?.exitCode === 0,
     };
+    if (!host.canPreview) {
+      $.ui.log(
+        "imgview: sips not found, so reply chips have no hover card; click a chip to open the picture",
+        { to: "debug" },
+      );
+    }
     // A module loaded again starts with no card: the files the last one made
     // for its own go, each by the path it was written down under.
     owned.clear();
@@ -1135,11 +1161,11 @@ export const register: Register = (on) => {
       // card, holds one in use, or draws one, and none does for a file
       // outside the working directory.
       const isHolding =
-        file.isOutside !== true &&
+        file.hasNoCard !== true &&
         reply !== undefined &&
         reply.drawing === cards &&
         onScreen.get(e.requestId) === reply;
-      if (file.isOutside !== true) isAsking = true;
+      if (file.hasNoCard !== true) isAsking = true;
       if (isHolding) {
         // No room among the cards on screen: this one waits, with no chip.
         if (slot === undefined && !admitThumb(io)) {

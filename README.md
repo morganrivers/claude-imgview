@@ -253,7 +253,8 @@ How the conversion itself is held:
   32 decoders at once.
 - Each shell and `sips` run for a chip is killed after five seconds
   (`PREVIEW_TIMEOUT_MS`), and ImageMagick is never run for one. So where `sips` is
-  missing (Linux) there are no hover cards, only `/img`.
+  missing (Linux) there are no hover cards: every chip is drawn with no card, as for a
+  file outside, and a click opens the picture in the pane through ImageMagick.
 - A preview still unfinished after 30 seconds (`PREVIEW_DEADLINE_MS`) is given up, so
   the cards behind it are drawn. Its commands cannot take that long at five seconds
   each; a file system call that never answers can. The preview given up starts no
