@@ -2,7 +2,7 @@ import { expect, mock, test } from "claude-code/testing";
 import type { On, RenderElement } from "claude-code";
 import type { Engine } from "claude-code/testing";
 
-import { toBase64 } from "../hooks/picture";
+import { pasteKey, toBase64 } from "../hooks/picture";
 
 /**
  * What a path leads to in the fake file system. An `image` is 200 by 100 in
@@ -43,6 +43,17 @@ const FORMATS: Record<string, string> = {
   webp: "webp",
   heic: "heic",
   svg: "svg",
+};
+
+/** The first bytes of a file of each format, as `od -An -tx1` prints them. */
+const HEADS: Record<string, string> = {
+  png: "89 50 4e 47 0d 0a 1a 0a 00 00 00 0d 49 48 44 52",
+  jpeg: "ff d8 ff e0 00 10 4a 46 49 46 00 01",
+  gif: "47 49 46 38 39 61 c8 00 64 00",
+  webp: "52 49 46 46 24 00 00 00 57 45 42 50 56 50 38 20",
+  heic: "00 00 00 18 66 74 79 70 68 65 69 63 00 00 00 00",
+  svg: "3c 73 76 67 20 78 6d 6c 6e 73 3d 22",
+  pdf: "25 50 44 46 2d 31 2e 37 0a",
 };
 
 /** A solid orange 24-bit BMP, bottom row first, as a converter would write. */
@@ -93,6 +104,13 @@ function world(
     rm?: { isFailing: boolean };
     // `sips` is not on the PATH, as on Linux.
     isSipsMissing?: boolean;
+    // ImageMagick is on the PATH: `magick` measures and converts, and `od`
+    // reads a file's first bytes.
+    isMagick?: boolean;
+    // What the store holds at the start.
+    store?: Record<string, unknown>;
+    // What `$.fs.list` answers for a directory.
+    listing?: Record<string, { name: string; mtimeMs: number }[]>;
     // The files removed since the test began: nothing finds or converts one.
     gone?: Set<string>;
     // Looking at this path waits at this gate.
@@ -148,6 +166,14 @@ function world(
   // How often each file was looked at: a `moved` one changes after the first.
   const looks = new Map<string, number>();
 
+  mock.store(on, extra.store ?? {});
+  on("session.id", () => ({ value: "s1" }));
+  on("fs.list", (_$, e) => ({ value: (extra.listing?.[e.path] ?? []).map((entry) => ({
+    ...entry,
+    kind: "file" as const,
+    size: 10,
+    isLink: false,
+  })) }));
   mock.env(on, {
     HOME: "/home/me",
     TMPDIR: "/tmp/t/",
@@ -218,8 +244,11 @@ function world(
   });
   on("process.run", async (_$, e) => {
     // The probe for `sips` at the session's start is not a run under test.
-    if (e.argv.join(" ") === "/bin/sh -c command -v sips") {
-      const exitCode = extra.isSipsMissing === true ? 1 : 0;
+    if (
+      e.argv.join(" ") === "/bin/sh -c command -v sips || command -v magick"
+    ) {
+      const exitCode =
+        extra.isSipsMissing === true && extra.isMagick !== true ? 1 : 0;
       return {
         value: {
           exitCode,
@@ -233,7 +262,11 @@ function world(
     runs.push([...e.argv]);
     timeouts.push(e.init?.timeoutMs);
     const tool = e.argv[0];
-    if (tool !== "sips" && tool !== "rm" && !isCopy(e.argv))
+    const isMagickRun =
+      extra.isMagick === true && (tool === "magick" || tool === "od");
+    if (tool === "sips" && extra.isSipsMissing === true)
+      return { deny: "not installed" };
+    if (tool !== "sips" && tool !== "rm" && !isCopy(e.argv) && !isMagickRun)
       return { deny: "not installed" };
     const done = (stdout = "", exitCode = 0) => ({
       value: {
@@ -278,6 +311,36 @@ function world(
       return done();
     }
 
+    if (tool === "od") {
+      const source = nameAt(e.argv[e.argv.length - 1]!);
+      const kind = source === undefined ? undefined : files[source];
+      const suffix = source?.split(".").pop() ?? "";
+      const format =
+        kind === "pdf" || kind === "jpeg"
+          ? kind
+          : kind === "text"
+            ? "text"
+            : (FORMATS[suffix] ?? suffix);
+
+      return done(` ${(HEADS[format] ?? "74 65 78 74").replace(/(.{47}) /g, "$1\n ")}\n`);
+    }
+    if (tool === "magick") {
+      // The source is the one argument that names a file, as CODER:path[0].
+      const sourceArg = e.argv.find((arg) => /\[0\]$/.test(arg)) ?? "";
+      const source = nameAt(sourceArg.replace(/^[A-Z0-9]+:/, "").replace(/\[0\]$/, ""));
+      const kind = source === undefined ? undefined : files[source];
+      const isPicture = kind !== undefined && kind !== "text" && kind !== "dir";
+      if (e.argv[1] === "identify") {
+        return isPicture ? done("200 100 PNG") : done("", 1);
+      }
+      const out = e.argv[e.argv.length - 1]!;
+      const resize = e.argv[e.argv.indexOf("-resize") + 1] ?? "";
+      const [w, h] = resize.replace("!", "").split("x").map(Number);
+      if (isPicture)
+        written.set(out, out.endsWith(".png") ? "png" : bmp(w!, h!));
+
+      return done("", isPicture ? 0 : 1);
+    }
     running++;
     peak = Math.max(peak, running);
     try {
@@ -330,6 +393,8 @@ function world(
   on("fs.exists", async (_$, e) => {
     if (e.path.endsWith(".png")) await extra.pngGate;
 
+    if (extra.listing?.[e.path] !== undefined) return { value: true };
+
     return { value: isWriting && written.has(e.path) };
   });
   on("session.start", (_$, e) => ({ cwd: e.cwd }));
@@ -346,6 +411,11 @@ function world(
     const { Text } = $.ui.resolve(e);
 
     return h(Text, {}, "ENGINE ROW") as RenderElement;
+  });
+  on("ui.render", { component: "UserMessage" }, ($, e) => {
+    const { Text } = $.ui.resolve(e);
+
+    return h(Text, {}, "ENGINE PROMPT") as RenderElement;
   });
   // Whether the pane is up: opened, and not closed by the test since.
   const pane = { isUp: false };
@@ -2693,7 +2763,9 @@ function clockGate(on: On, nth: number) {
   const gate = new Promise<void>((resolve) => {
     open = resolve;
   });
-  let readings = 0;
+  // Nothing is counted until the test arms the gate: the session's start
+  // reads the clock too.
+  let readings = Number.NEGATIVE_INFINITY;
   // A second hook on the clock, above the one `mock.clock` answers with.
   on("clock.now", {}, async (_$, e, next) => {
     if (++readings === nth) await gate;
@@ -2954,4 +3026,174 @@ test("converts the pane's picture again when the session's end took the bitmap f
   expect(runs.filter((argv) => argv[1] === "-s")).toHaveLength(2);
   expect(await ui.find({ type: "Raster" })).toBeDefined();
   expect(await ui.find({ type: "Text", text: /: / })).toBeUndefined();
+});
+
+/** A prompt row as the engine draws it, with the person's own text. */
+function prompt($: Engine, text: string, id = "prompt-1") {
+  return $.ui.mount({
+    plugin: "imgview",
+    surface: "terminal",
+    component: "UserMessage",
+    requestId: id,
+    props: {
+      text,
+      origin: { kind: "composer" },
+      isExpanded: true,
+      onScreen: { first: 0, last: 1, of: 2 },
+    },
+    viewport: { columns: 120, rows: 50, isFullscreen: true },
+  });
+}
+
+/** Whether a drawing holds a box laid over the rows above it. */
+async function isOverlaid(ui: Awaited<ReturnType<typeof reply>>) {
+  let found = false;
+  const walk = (node: unknown) => {
+    if (Array.isArray(node)) return node.forEach(walk);
+    if (typeof node !== "object" || node === null) return;
+    const { props, children } = node as Node;
+    if (props?.position === "absolute") found = true;
+    walk(children);
+  };
+  walk(await ui.drawn());
+
+  return found;
+}
+
+test("previews with ImageMagick where sips is missing, reading the file only as the format its first bytes name", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" }, {}, true, undefined, {
+    isSipsMissing: true,
+    isMagick: true,
+  });
+  await start($);
+
+  const ui = await reply($, "Saved `shot.png`.");
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+  const magick = runs.filter((argv) => argv[0] === "magick");
+  expect(magick.length).toBeGreaterThan(0);
+  // Every source ImageMagick is handed carries a pinned coder.
+  for (const argv of magick) {
+    const source = argv.find((arg) => arg.endsWith("[0]"));
+    expect(source).toMatch(/^PNG:/);
+  }
+  expect(runs.some((argv) => argv[0] === "od")).toBe(true);
+});
+
+test("hands ImageMagick no file whose first bytes name no bitmap", async ($, on) => {
+  const { runs } = world(on, { "scan.png": "pdf", "notes.png": "text" }, {}, true, undefined, {
+    isSipsMissing: true,
+    isMagick: true,
+  });
+  await start($);
+
+  const ui = await reply($, "See scan.png and notes.png.");
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(0);
+  expect(runs.filter((argv) => argv[0] === "magick")).toEqual([]);
+});
+
+test(
+  "draws each chip's picture under it when the preview option is inline, for files outside the working directory too",
+  { options: { preview: "inline" } },
+  async ($, on) => {
+    world(on, { "a.png": "image", "/home/me/shots/b.png": "image" });
+    await start($);
+
+    const ui = await reply($, "a.png and /home/me/shots/b.png");
+    expect(await ui.findAll({ type: "Button" })).toHaveLength(2);
+    expect(await ui.findAll({ type: "Raster" })).toHaveLength(2);
+    expect(await isOverlaid(ui)).toBe(false);
+    expect(await cards(ui)).toHaveLength(0);
+  },
+);
+
+test("keeps the hover card, and no picture for a file outside, by default", async ($, on) => {
+  world(on, { "a.png": "image", "/home/me/shots/b.png": "image" });
+  await start($);
+
+  const ui = await reply($, "a.png and /home/me/shots/b.png");
+  expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+  expect(await isOverlaid(ui)).toBe(true);
+});
+
+test(
+  "draws a chip with its picture under a prompt sent with pasted images, and opens the pane on a click",
+  { options: { preview: "inline" } },
+  async ($, on) => {
+    const saved = "/home/me/.claude/imgview-pastes/1.png";
+    const { opened } = world(on, { [saved]: "image" }, {}, true, undefined, {
+      store: {
+        [pasteKey("s1", "look [Image #1]")]: {
+          paths: [saved],
+          savedAt: 1_700_000_000_000,
+        },
+      },
+    });
+    await start($);
+
+    const ui = await prompt($, "look [Image #1]");
+    const chips = await ui.findAll({ type: "Button" });
+    expect(chips.map((chip) => chip.props.label)).toEqual(["▣ Image #1"]);
+    expect(await ui.findAll({ type: "Raster" })).toHaveLength(1);
+    await ui.press({ key: "imgview-open-0" });
+    expect(opened).toHaveLength(1);
+  },
+);
+
+test("leaves a prompt as the engine drew it when it was sent with no pasted image", async ($, on) => {
+  const { runs } = world(on, {});
+  await start($);
+
+  const ui = await prompt($, "hello");
+  expect(await ui.findAll({ type: "Button" })).toHaveLength(0);
+  expect(runs).toEqual([]);
+});
+
+test("removes pasted images, and what the store says of them, after 30 days", async ($, on) => {
+  const day = 24 * 60 * 60 * 1000;
+  const now = 1_700_000_000_000;
+  const dir = "/home/me/.claude/imgview-pastes";
+  const deleted: string[] = [];
+  on("store.delete", {}, (_$, e, next) => {
+    deleted.push(e.key);
+
+    return next(e);
+  });
+  const { runs } = world(on, { [dir]: "dir" }, {}, true, undefined, {
+    store: {
+      [pasteKey("s0", "old")]: { paths: [`${dir}/old.png`], savedAt: now - 31 * day },
+      [pasteKey("s0", "new")]: { paths: [`${dir}/new.png`], savedAt: now - 29 * day },
+      other: 1,
+    },
+    listing: {
+      [dir]: [
+        { name: "old.png", mtimeMs: now - 31 * day },
+        { name: "new.png", mtimeMs: now - 29 * day },
+      ],
+    },
+  });
+  await start($);
+
+  expect(deleted).toEqual([pasteKey("s0", "old")]);
+  expect(runs).toContainEqual(["rm", "-f", "--", `${dir}/old.png`]);
+  expect(runs.flat()).not.toContain(`${dir}/new.png`);
+});
+
+test("lets a prompt go on, and says so, when a pasted image cannot be read", async ($, on) => {
+  const { toasts } = world(on, {});
+  const reached: string[] = [];
+  on("prompt.submit", (_$, e) => {
+    reached.push(e.text);
+
+    return { text: e.text };
+  });
+  await start($);
+
+  await $.prompt.submit({
+    text: "look [Image #1]",
+    attachments: [{ type: "image", mediaType: "image/png", id: "img-1" }],
+    origin: { kind: "composer" },
+    wait: false,
+  });
+  expect(reached).toEqual(["look [Image #1]"]);
+  expect(toasts.some((text) => text.startsWith("imgview: could not save a pasted image"))).toBe(true);
 });

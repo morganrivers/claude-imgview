@@ -7,8 +7,25 @@ Preview images without leaving Claude Code, two ways:
   chip and a card with the picture pops up over the rows above it; move away and it is
   gone. A click on a chip opens the picture in the pane. A file elsewhere on the machine
   gets a chip that says where it is (`▣ ~/Desktop/shot.png`) and no card: click it.
+- **Inline.** With the `preview` option set to `inline`, each chip shows a small
+  picture under it instead (at most 60 by 12 cells), in the normal layout, so it scrolls
+  with the text. Files outside the working directory get one too. A click still opens
+  the pane.
+- **Pasted images.** An image pasted into a prompt is saved as a file of the mod's own
+  (`~/.claude/imgview-pastes/`, kept 30 days) and gets a chip under the prompt
+  (`▣ Image #1`), with a card or an inline picture as above.
 - **`/img <path>`** opens a picture in a pane of the session: docked beside the
   transcript in the fullscreen layout from 110 columns, inline above the prompt otherwise.
+
+## Options
+
+`/config` lists one row for the mod, `preview`, stored in settings under
+`pluginConfigs`:
+
+| Value             | What a chip shows                                                          |
+| ----------------- | -------------------------------------------------------------------------- |
+| `hover` (default) | A card over the rows above, while the pointer is on the chip.              |
+| `inline`          | A small picture under the chip, scrolling with the text, for every file.   |
 
 ## Install
 
@@ -59,7 +76,8 @@ is recorded in the transcript as any command's output is.
 **It sends nothing.** The module makes no network call and no model call. `claude plugin
 validate .` prints every engine call it makes: `$.clock`, `$.command.register`,
 `$.env.get`, `$.fs.stat`, `$.fs.exists`, `$.fs.read`, `$.process.run`, `$.state` and
-`$.ui`. The one way out of the module is `$.process.run`, and all it starts are the six
+`$.ui`, plus `$.store`, `$.session.id`, `$.fs.list` and `$.prompt.media` for pasted
+images. The one way out of the module is `$.process.run`, and all it starts are the
 local commands below.
 
 ### The programs it starts
@@ -71,16 +89,25 @@ is fixed text that takes its two paths as positional arguments.
 ```
 sips -g format -g pixelWidth -g pixelHeight <file>
 sips -s format <bmp or png> [-z <height> <width>] <file> --out <temp>
-magick identify -format "%w %h %m" <file>[0]
-magick <file>[0] [-resize <width>x<height>!] <temp>
+magick identify -format "%w %h %m" [<FORMAT>:]<file>[0]
+magick [<FORMAT>:]<file>[0] [-resize <width>x<height>!] <temp>
+od -An -tx1 -N32 -- <file>
 /bin/sh -c 'set -C; { cat -- "$1" || exit 4; } >"$2" || exit 3' sh <file> <temp>
-rm -f <temp>...
+/bin/sh -c 'umask 077; mkdir -p -- "$1" && set -C && base64 -d >"$2"' sh <dir> <paste>
+rm -f [--] <temp or old paste>...
 ```
 
 - `sips` measures a picture and converts it to the size on screen. It is the converter
   macOS ships.
-- `magick` (ImageMagick) does the same where `sips` cannot read the file, for `/img` and
-  a clicked chip only. It is not run for a hover card.
+- `magick` (ImageMagick) does the same where `sips` is not installed (Linux). For a
+  chip's picture it reads the file only as the bitmap format its first 32 bytes name
+  (`od`, then `sniffFormat` in `hooks/picture.ts`: PNG, JPEG, GIF, WebP, TIFF, BMP or
+  HEIC), written as `PNG:<file>[0]`, so it never guesses a format and never hands the
+  file to a delegate such as Ghostscript. A file with no such bytes is not opened. Where
+  `sips` ran and could not read the file, ImageMagick is not asked.
+- The second `/bin/sh` saves a pasted image's bytes, as the engine resized them, to a
+  new file of a random name in `~/.claude/imgview-pastes/` (mode 600, never over a
+  file). At each session start, pastes older than 30 days are removed.
 - `/bin/sh` runs `cat` to copy a file a reply named, before anything decodes it (see
   "What a reply can make the mod open").
 - `rm -f` removes the mod's own temporary files, by the exact paths it wrote down.
@@ -251,10 +278,9 @@ How the conversion itself is held:
 - One preview is converted at a time (`drain` takes one job from `queue` and returns at
   once while another call is running): 32 mentions mean 32 conversions in a row, never
   32 decoders at once.
-- Each shell and `sips` run for a chip is killed after five seconds
-  (`PREVIEW_TIMEOUT_MS`), and ImageMagick is never run for one. So where `sips` is
-  missing (Linux) there are no hover cards: every chip is drawn with no card, as for a
-  file outside, and a click opens the picture in the pane through ImageMagick.
+- Each shell, `od`, `sips` and `magick` run for a chip is killed after five seconds
+  (`PREVIEW_TIMEOUT_MS`). Where neither `sips` nor `magick` is installed, every chip is
+  drawn with no card, as for a file outside, and a click says why in a toast.
 - A preview still unfinished after 30 seconds (`PREVIEW_DEADLINE_MS`) is given up, so
   the cards behind it are drawn. Its commands cannot take that long at five seconds
   each; a file system call that never answers can. The preview given up starts no
@@ -334,12 +360,12 @@ whether a layout is broken; it is not enough to read small text.
 
 ## Requires
 
-One converter on `PATH`. For `/img` the mod tries them in this order; a hover card uses
-the first alone:
+One converter on `PATH`. The mod tries them in this order:
 
 1. `sips`, which macOS ships. Checked on macOS 14.5: PNG, JPEG, HEIC, GIF, WebP, SVG
    and PDF (first page); `sips --formats` lists the rest.
-2. `magick` (ImageMagick 7), for whatever sips cannot read, and on Linux.
+2. `magick` (ImageMagick 7), on Linux. For a chip it reads bitmaps alone, by the
+   format their first bytes name.
 
 Each `/img` runs the converter once to measure the picture and, in `cells` mode, once
 per pane size to resize it to exactly the cells on screen: one size at a time, and of

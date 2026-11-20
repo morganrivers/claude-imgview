@@ -1,6 +1,6 @@
 {
   "name": "imgview",
-  "description": "Preview images inside Claude Code: hover the chip under a reply that names an image file to pop its picture up, click it to open the picture in a pane, or use /img <path>. Pixels on kitty and Ghostty, colored block characters on every other terminal.",
+  "description": "Preview images inside Claude Code: each image a reply names, and each image pasted into a prompt, gets a chip. Click a chip to open the picture in a pane. Set the preview option to show a small picture under each chip that scrolls with the text, or to pop it up when the pointer is on the chip. /img <path> opens any image. Pixels on kitty and Ghostty, colored block characters on every other terminal.",
   "version": "0.2.1",
   "author": {
     "name": "hieuvo"
@@ -8,6 +8,25 @@
   "homepage": "https://github.com/hieuvo/claude-imgview",
   "repository": "https://github.com/hieuvo/claude-imgview",
   "license": "MIT",
-  "keywords": ["image", "preview", "pane", "terminal", "screenshot", "mod"],
-  "types": "./types/index.d.ts"
+  "keywords": [
+    "image",
+    "preview",
+    "pane",
+    "terminal",
+    "screenshot",
+    "mod"
+  ],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "preview": {
+      "type": "string",
+      "title": "Chip picture",
+      "description": "inline: a small picture under each chip, scrolling with the text. hover: the picture pops up while the pointer is on the chip.",
+      "options": [
+        "hover",
+        "inline"
+      ],
+      "default": "hover"
+    }
+  }
 }

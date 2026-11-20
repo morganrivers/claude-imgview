@@ -1,8 +1,15 @@
 import { atom, read, update } from "claude-code";
-import type { Register } from "claude-code";
+import type {
+  Elements,
+  EngineInterface,
+  Register,
+  RenderElement,
+  RenderInput,
+} from "claude-code";
 
 import type { Shown } from "../types";
 import {
+  PASTE_KEY,
   baseName,
   decodeBmp,
   expandHome,
@@ -14,8 +21,11 @@ import {
   isInside,
   parseArgs,
   parseIdentifySize,
+  parseOdBytes,
+  pasteKey,
   parseSipsSize,
   shortenPath,
+  sniffFormat,
   tempDir,
   toCells,
 } from "./picture";
@@ -49,6 +59,25 @@ const HINT = {
 } as const;
 const CARD_COLUMNS = 80;
 const CARD_ROWS = 24;
+// With the `inline` option the picture sits in the transcript under its chip,
+// so it is kept smaller than a hover card.
+const INLINE_COLUMNS = 60;
+const INLINE_ROWS = 12;
+// Images pasted into a prompt are saved under the home directory, as the
+// mod's own files, and removed this long after they were pasted.
+const PASTE_DIR = ".claude/imgview-pastes";
+const PASTE_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+// The store key of a prompt's pasted images: the session and the prompt text.
+const PASTE_SUFFIX: Record<string, string> = {
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/gif": "gif",
+  "image/webp": "webp",
+};
+// Writes standard input, base64, to $2 as bytes, in a folder $1 only the
+// person reads. The name is new: noclobber refuses one that is there.
+const SAVE_PASTE =
+  'umask 077; mkdir -p -- "$1" && set -C && base64 -d >"$2"';
 // The pixels a card's PNG is given a cell, where the terminal draws pixels.
 const CARD_CELL_PIXELS = { width: 10, height: 20 };
 // A reply is drawn again for every piece that streams in: a path is looked up
@@ -110,10 +139,10 @@ type Frame = {
 };
 
 /**
- * A file a path leads to: where it landed and when it last changed. One
- * outside the working directory, or any file where `sips` is missing, gets a
- * chip to click and no card: nothing of it is converted before the person
- * asks.
+ * A file a path leads to: where it landed and when it last changed. One with
+ * `hasNoCard` (outside the working directory under the `hover` option, or any
+ * file where no converter is installed) gets a chip to click and no card:
+ * nothing of it is converted before the person asks.
  */
 type Located = {
   path: string;
@@ -121,6 +150,9 @@ type Located = {
   isOutside?: true;
   hasNoCard?: true;
 };
+
+/** A chip to draw: the file, and what the chip says. */
+type Chip = { file: Located; label: string; name: string };
 
 /**
  * A hover card's picture, measured and converted: cells, or on a terminal
@@ -164,12 +196,16 @@ type Job = {
 
 /** How a conversion is held back: `/img` passes none of these. */
 type Limits = {
-  /** No ImageMagick where `sips` cannot. */
-  isSipsOnly?: boolean;
+  /**
+   * Where `sips` cannot, ImageMagick reads only the bitmap format the file's
+   * first bytes show: never one it would guess, or hand to a delegate such
+   * as Ghostscript.
+   */
+  isSniffed?: boolean;
   timeoutMs?: number;
 };
 
-const PREVIEW: Limits = { isSipsOnly: true, timeoutMs: PREVIEW_TIMEOUT_MS };
+const PREVIEW: Limits = { isSniffed: true, timeoutMs: PREVIEW_TIMEOUT_MS };
 
 /**
  * What the converters need of the engine, bound once at `session.start`: a
@@ -220,11 +256,33 @@ type Host = {
    */
   isPixelTerminal: boolean;
   /**
-   * Whether `sips` is on the PATH. Cards are made by `sips` alone, so without
-   * it (Linux) every chip is drawn with no card, as for a file outside.
+   * Whether `sips` or ImageMagick is on the PATH. Without either every chip
+   * is drawn with no card, as for a file outside.
    */
   canPreview: boolean;
 };
+
+/**
+ * How ImageMagick is to name the file, or undefined where it may not read it:
+ * under `isSniffed`, with the format its first bytes show written before it.
+ */
+async function magickSource(
+  host: Host,
+  path: string,
+  limits: Limits,
+): Promise<string | undefined> {
+  if (limits.isSniffed !== true) return `${path}[0]`;
+  const head = await host.run(
+    ["od", "-An", "-tx1", "-N32", "--", path],
+    limits.timeoutMs,
+  );
+  if (head?.exitCode !== 0) return undefined;
+  const format = sniffFormat(parseOdBytes(head.stdout));
+
+  return format === undefined
+    ? undefined
+    : `${format.toUpperCase()}:${path}[0]`;
+}
 
 async function measure(
   host: Host,
@@ -236,9 +294,13 @@ async function measure(
     limits.timeoutMs,
   );
   const size = sips ? parseSipsSize(sips.stdout) : undefined;
-  if (size !== undefined || limits.isSipsOnly) return size;
+  if (size !== undefined) return size;
+  // sips ran and could not read it: ImageMagick is not asked to guess.
+  if (sips !== undefined && limits.isSniffed === true) return undefined;
+  const source = await magickSource(host, path, limits);
+  if (source === undefined) return undefined;
   const magick = await host.run(
-    ["magick", "identify", "-format", "%w %h %m", `${path}[0]`],
+    ["magick", "identify", "-format", "%w %h %m", source],
     limits.timeoutMs,
   );
 
@@ -259,14 +321,17 @@ async function convert(
   const format = out.endsWith(".png") ? "png" : "bmp";
   const resample = size ? ["-z", String(size.height), String(size.width)] : [];
   // sips exits 0 on a file it cannot read: the written file is the proof.
-  await host.run(
+  const sips = await host.run(
     ["sips", "-s", "format", format, ...resample, path, "--out", out],
     limits.timeoutMs,
   );
   const isWritten = await host.exists(out);
-  if (isWritten || limits.isSipsOnly) return isWritten;
+  if (isWritten) return true;
+  if (sips !== undefined && limits.isSniffed === true) return false;
+  const source = await magickSource(host, path, limits);
+  if (source === undefined) return false;
   const resize = size ? ["-resize", `${size.width}x${size.height}!`] : [];
-  await host.run(["magick", `${path}[0]`, ...resize, out], limits.timeoutMs);
+  await host.run(["magick", source, ...resize, out], limits.timeoutMs);
 
   return host.exists(out);
 }
@@ -285,8 +350,8 @@ async function rasterize(
   const size = { width: box.columns * 2, height: box.rows * 2 };
   if (!(await convert(host, path, out, size, limits))) {
     throw new Error(
-      limits.isSipsOnly
-        ? "sips could not convert it"
+      limits.isSniffed === true
+        ? "no converter could read it as a bitmap"
         : "neither sips nor ImageMagick could convert it",
     );
   }
@@ -311,30 +376,29 @@ async function rasterize(
  * The file a reply's mention leads to, a `~` expanded and every link
  * followed: a regular file named as a bitmap is where it lands, as the
  * mention was where it was written. One outside the session's working
- * directory is marked so, whatever its size; one inside is no larger than a
+ * directory is marked so; it has no card, whatever its size, unless
+ * `isOutsideCarded` (the `inline` option). Any other is no larger than a
  * preview takes. Undefined for anything else.
  */
 async function locateMention(
   host: Host,
   given: string,
+  isOutsideCarded: boolean,
 ): Promise<Located | undefined> {
   if (host.root === undefined) return undefined;
   const found = await host.stat(expandHome(given, host.home));
   if (found?.kind !== "file" || found.realPath === undefined) return undefined;
   // A link named like a picture is taken by the name of what it leads to.
   if (!hasImageSuffix(found.realPath)) return undefined;
-  if (!isInside(found.realPath, host.root))
-    return {
-      path: found.realPath,
-      mtimeMs: found.mtimeMs,
-      isOutside: true,
-      hasNoCard: true,
-    };
-  if (!host.canPreview)
-    return { path: found.realPath, mtimeMs: found.mtimeMs, hasNoCard: true };
+  const file: Located = { path: found.realPath, mtimeMs: found.mtimeMs };
+  if (!isInside(found.realPath, host.root)) {
+    file.isOutside = true;
+    if (!isOutsideCarded) return { ...file, hasNoCard: true };
+  }
+  if (!host.canPreview) return { ...file, hasNoCard: true };
   if (found.size > PREVIEW_MAX_BYTES) return undefined;
 
-  return { path: found.realPath, mtimeMs: found.mtimeMs };
+  return file;
 }
 
 /**
@@ -346,6 +410,7 @@ async function preview(
   host: Host,
   file: Located,
   maxColumns: number,
+  maxRows: number,
 ): Promise<Card | undefined> {
   const copy = host.tempPath("snap");
   let isCopyMine = false;
@@ -382,7 +447,7 @@ async function preview(
       size.width * size.height > PREVIEW_MAX_PIXELS
     )
       return undefined;
-    const box = fit(size, maxColumns, CARD_ROWS);
+    const box = fit(size, maxColumns, maxRows);
     if (host.isPixelTerminal) {
       // A small PNG of the mod's own for the terminal to read, whatever the
       // file's format: never the file the reply named.
@@ -488,6 +553,9 @@ async function replace(
  * What the pane asks of the layout for a picture: inline, the rows the picture
  * fills under the full width; docked, a share of the columns.
  */
+/** What the pane asks of the layout. */
+type PaneSize = ReturnType<typeof paneRequest>;
+
 function paneRequest(picture: Shown, columns: number) {
   const inline = fit(
     picture,
@@ -504,7 +572,165 @@ function paneRequest(picture: Shown, columns: number) {
   };
 }
 
-export const register: Register = (on) => {
+/** The images pasted with one prompt, as the store keeps them. */
+type Pasted = { paths: string[]; savedAt: number };
+
+function isPasted(value: unknown): value is Pasted {
+  if (typeof value !== "object" || value === null) return false;
+  const { paths, savedAt } = value as Record<string, unknown>;
+
+  return (
+    Array.isArray(paths) &&
+    paths.every((path) => typeof path === "string") &&
+    typeof savedAt === "number"
+  );
+}
+
+/** The images pasted with a prompt, by its key: `cache` first, then the store. */
+async function pastesOf(
+  $: EngineInterface,
+  cache: Map<string, string[]>,
+  key: string,
+): Promise<string[]> {
+  const known = cache.get(key);
+  if (known !== undefined) return known;
+  const stored = await $.store.get(key);
+  const paths = isPasted(stored) ? stored.paths : [];
+  cache.set(key, paths);
+
+  return paths;
+}
+
+/**
+ * Saves one pasted image as a file of the mod's own, and answers its path.
+ * Throws with the reason when the engine gives no bytes or the shell
+ * writes none.
+ */
+async function savePaste(
+  $: EngineInterface,
+  dir: string,
+  id: string,
+): Promise<string> {
+  let base64 = "";
+  let mediaType: string | undefined;
+  let offset: number | undefined = 0;
+  while (offset !== undefined) {
+    const part = await $.prompt.media({ id, offset });
+    if (part.deny !== undefined) throw new Error(part.deny);
+    if (part.unreadable !== undefined) throw new Error(part.unreadable);
+    base64 += part.base64;
+    mediaType = part.mediaType;
+    offset = part.next;
+  }
+  const suffix = mediaType === undefined ? undefined : PASTE_SUFFIX[mediaType];
+  if (suffix === undefined)
+    throw new Error(`not a picture type the mod saves: ${mediaType}`);
+  const path = `${dir}/${crypto.randomUUID()}.${suffix}`;
+  const done = await $.process.run(
+    ["/bin/sh", "-c", SAVE_PASTE, "sh", dir, path],
+    { stdin: base64, timeoutMs: PREVIEW_TIMEOUT_MS },
+  );
+  if (done.exitCode !== 0)
+    throw new Error(`the shell exited ${done.exitCode}: ${done.stderr}`);
+
+  return path;
+}
+
+/** Says, as a toast and in the debug log, why a pasted image was not kept. */
+function tellPasteFailure($: EngineInterface, error: unknown) {
+  const reason = error instanceof Error ? error.message : String(error);
+  const line = `imgview: could not save a pasted image: ${reason}`;
+  $.ui.toast(line);
+  $.ui.log(line, { to: "debug" });
+}
+
+/**
+ * Removes the pasted images saved more than `PASTE_MAX_AGE_MS` ago, and the
+ * store's record of each prompt that old.
+ */
+async function forgetOldPastes(
+  $: EngineInterface,
+  io: Host,
+  dir: string | undefined,
+) {
+  const cutoff = (await $.clock.now()) - PASTE_MAX_AGE_MS;
+  for (const key of await $.store.keys()) {
+    if (!key.startsWith(PASTE_KEY)) continue;
+    const stored = await $.store.get(key);
+    if (!isPasted(stored) || stored.savedAt < cutoff) await $.store.delete(key);
+  }
+  if (dir === undefined || !(await io.exists(dir))) return;
+  const old = (await $.fs.list(dir))
+    .filter((entry) => entry.kind === "file" && entry.mtimeMs < cutoff)
+    .map((entry) => `${dir}/${entry.name}`);
+  if (old.length === 0) return;
+  const done = await io.run(["rm", "-f", "--", ...old]);
+  if (done?.exitCode !== 0)
+    $.ui.log(`imgview: could not remove ${old.length} old pasted images`, {
+      to: "debug",
+    });
+}
+
+/**
+ * A click is the person's: the pane takes the file itself, as it is now
+ * and not as it was when the card was drawn. `inTurn` runs one pane change
+ * at a time; `sized` says what the pane asks of the layout.
+ */
+async function openFile(
+  $: EngineInterface,
+  io: Host,
+  file: Located,
+  name: string,
+  columns: number,
+  inTurn: <T>(work: () => Promise<T>) => Promise<T>,
+  sized: (picture: Shown, columns: number, isUp: boolean) => PaneSize,
+) {
+  const found = await io.stat(file.path);
+  if (found?.kind !== "file") {
+    $.ui.toast(`imgview: not a file any more: ${name}`);
+
+    return;
+  }
+  const fresh = {
+    path: found.realPath ?? file.path,
+    mtimeMs: found.mtimeMs,
+  };
+  const size = await measure(io, fresh.path);
+  if (size === undefined) {
+    $.ui.toast(`imgview: not an image sips or ImageMagick can read: ${name}`);
+
+    return;
+  }
+  const mode = io.isPixelTerminal ? "pixels" : "cells";
+  let picture: Shown | undefined;
+  try {
+    picture = await inTurn(() => replace($, io, fresh, size, mode));
+  } catch {
+    $.ui.toast(`imgview: could not show ${name}, try again`);
+
+    return;
+  }
+  if (picture === undefined) {
+    $.ui.toast(`imgview: could not convert to PNG: ${name}`);
+
+    return;
+  }
+  const isUp = (await $.ui.panes()).some((pane) => pane.id === PANE);
+  await $.ui.open(sized(picture, columns, isUp));
+}
+
+export const register: Register = (on, options) => {
+  // `inline`: each chip's picture is drawn under it, for every file, in the
+  // working directory or not. `hover`: hidden over the rows above until the
+  // pointer is on the chip, and none for a file outside.
+  const isInline = options.preview === "inline";
+  const cardColumns = isInline ? INLINE_COLUMNS : CARD_COLUMNS;
+  const cardRows = isInline ? INLINE_ROWS : CARD_ROWS;
+  // The session the pasted images are kept under, and where they are saved.
+  let sessionId: string | undefined;
+  let pasteDir: string | undefined;
+  // The store's answers, by key: a prompt's pasted images, or none.
+  const pastes = new Map<string, string[]>();
   let host: Host | undefined;
   let frame: Frame | undefined;
   // Whether the pane has a conversion in flight, and what its last drawing
@@ -755,7 +981,7 @@ export const register: Register = (on) => {
         resolve(isLate ? undefined : card);
       };
       // Rejected: not a picture sips converts, and the chip is dropped.
-      preview(bound, job.file, job.maxColumns).then(settle, () =>
+      preview(bound, job.file, job.maxColumns, cardRows).then(settle, () =>
         settle(undefined),
       );
     });
@@ -902,14 +1128,19 @@ export const register: Register = (on) => {
           (await $.env.get("TERM_PROGRAM"))?.toLowerCase() === "ghostty" ||
           (await $.env.get("KITTY_WINDOW_ID")) !== undefined),
       canPreview:
-        (await run(["/bin/sh", "-c", "command -v sips"]))?.exitCode === 0,
+        (await run(["/bin/sh", "-c", "command -v sips || command -v magick"]))
+          ?.exitCode === 0,
     };
     if (!host.canPreview) {
       $.ui.log(
-        "imgview: sips not found, so reply chips have no hover card; click a chip to open the picture",
+        "imgview: neither sips nor ImageMagick found, so chips have no picture; click a chip to open it",
         { to: "debug" },
       );
     }
+    sessionId = await $.session.id();
+    pasteDir = host.home === undefined ? undefined : `${host.home}/${PASTE_DIR}`;
+    pastes.clear();
+    await forgetOldPastes($, host, pasteDir);
     // A module loaded again starts with no card: the files the last one made
     // for its own go, each by the path it was written down under.
     owned.clear();
@@ -1085,28 +1316,35 @@ export const register: Register = (on) => {
     );
   });
 
-  // Under a reply that names image files: one chip a file. The pointer on a
-  // chip reveals a card with the picture over the rows above; a click opens
-  // the pane. The surface applies the hover itself, so the card is drawn
-  // ahead of it, hidden, while the reply is on screen.
-  on("ui.render", { component: "AssistantMessage" }, async ($, e, next) => {
-    const row = await next(e);
-    if (e.surface !== "terminal" || host === undefined) return row;
-    // Only the fullscreen terminal reports the pointer. A reply that draws
-    // no chip, there or for want of a file named, holds no card either.
+  /**
+   * Draws the chips under a message, one a file `find` answers. A click opens
+   * the pane. Under `hover` the pointer on a chip reveals a card with the
+   * picture over the rows above: the surface applies the hover itself, so the
+   * card is drawn ahead of it, hidden, while the message is on screen. Under
+   * `inline` the picture is drawn under its chip.
+   */
+  async function withChips(
+    e: RenderInput<"AssistantMessage" | "UserMessage", "terminal">,
+    row: RenderElement,
+    elements: Elements["terminal"],
+    onOpen: (
+      io: Host,
+      file: Located,
+      name: string,
+      columns: number,
+    ) => Promise<void>,
+    find: (io: Host) => Promise<Chip[]>,
+  ): Promise<RenderElement> {
+    if (host === undefined) return row;
+    // Only the fullscreen terminal reports the pointer. A message that draws
+    // no chip, there or for want of a file, holds no card either.
     if (e.viewport?.isFullscreen !== true) {
       leave(e.requestId);
 
       return row;
     }
-    const mentions = findImagePaths(e.props.text, MAX_CHIPS);
-    if (mentions.length === 0) {
-      leave(e.requestId);
 
-      return row;
-    }
-
-    const { Box, Button, Image, Raster, Text } = $.ui.resolve(e);
+    const { Box, Button, Image, Raster, Text } = elements;
     const io = host;
     // Where the terminal does not say what is on screen, nothing is taken to
     // be: the chips are drawn, and no card is made or drawn for them.
@@ -1116,50 +1354,25 @@ export const register: Register = (on) => {
         ? undefined
         : enter(e.requestId);
     if (reply === undefined) leave(e.requestId);
-    // The cards this drawing asks for. They are the reply's own once the
+    // The cards this drawing asks for. They are the message's own once the
     // drawing is done, and no other drawing's set is touched meanwhile.
     const cards = new Set<string>();
     if (reply !== undefined) reply.drawing = cards;
     const columns = e.viewport.columns;
-    const maxColumns = Math.max(16, Math.min(CARD_COLUMNS, columns - 12));
+    const maxColumns = Math.max(16, Math.min(cardColumns, columns - 12));
+    const drawnUnder = boundary;
+    const found = await find(io);
     const chips = [];
     let offset = 0;
-    // Whether an inside file of this reply's asks for a card, got or not.
+    // Whether a file of this message's asks for a card, got or not.
     let isAsking = false;
-    const drawnUnder = boundary;
-    for (const mention of mentions) {
-      const now = await $.clock.now();
-      // Between two working directories nothing is looked up, or remembered:
-      // asked once the clock has answered, behind which a change may have come.
-      if (io.root === undefined) break;
-      let entry = located.get(mention);
-      if (entry === undefined || now - entry.at > LOCATE_TTL_MS) {
-        const asked = boundary;
-        entry = { at: now, file: await locateMention(io, mention) };
-        // Looked up under a working directory that has since changed.
-        if (asked !== boundary) continue;
-        located.delete(mention);
-        if (located.size >= MAX_LOCATED) {
-          for (const [key, old] of located) {
-            if (now - old.at > LOCATE_TTL_MS) located.delete(key);
-          }
-        }
-        // Still full of fresh lookups: the oldest of them goes.
-        for (const key of located.keys()) {
-          if (located.size < MAX_LOCATED) break;
-          located.delete(key);
-        }
-        located.set(mention, entry);
-      }
-      const file = entry.file;
-      if (file === undefined) continue;
-
+    for (const { file, label, name } of found) {
       const id = `${file.path}|${file.mtimeMs}|${maxColumns}`;
       if (failed.has(id)) continue;
       const slot = thumbs.get(id);
-      // Only the drawing begun last of a reply still on screen asks for a
+      // Only the drawing begun last of a message still on screen asks for a
       // card, holds one in use, or draws one, and none does for a file
-      // outside the working directory.
+      // that has no card.
       const isHolding =
         file.hasNoCard !== true &&
         reply !== undefined &&
@@ -1179,11 +1392,6 @@ export const register: Register = (on) => {
       const card = slot?.card;
 
       const index = chips.length;
-      const name = baseName(file.path);
-      const label =
-        file.isOutside === true
-          ? `▣ ${shortenPath(file.path, io.home, OUTSIDE_LABEL_MAX)}`
-          : `▣ ${name}`;
       const width = card === undefined ? 16 : card.columns;
       const caption = (
         card === undefined
@@ -1192,57 +1400,37 @@ export const register: Register = (on) => {
       )
         .slice(0, width)
         .padEnd(width);
+      const picture =
+        card?.png !== undefined ? (
+          <Image
+            key={`imgview-thumb-${index}`}
+            source={{ file: card.png, format: "png" }}
+            columns={card.columns}
+            rows={card.rows}
+            alt={name}
+          />
+        ) : card?.cells !== undefined ? (
+          <Raster
+            key={`imgview-thumb-${index}`}
+            columns={card.columns}
+            rows={card.rows}
+            cells={card.cells}
+          />
+        ) : undefined;
       chips.push(
-        <Box key={`imgview-chip-${index}`}>
+        <Box
+          key={`imgview-chip-${index}`}
+          flexDirection={isInline ? "column" : "row"}
+        >
           <Button
             key={`imgview-open-${index}`}
             plain
             dimColor
             label={label}
-            onPress={async () => {
-              // A click is the person's: the pane takes the file itself, as
-              // it is now and not as it was when the card was drawn.
-              const found = await io.stat(file.path);
-              if (found?.kind !== "file") {
-                $.ui.toast(`imgview: not a file any more: ${name}`);
-
-                return;
-              }
-              const fresh = {
-                path: found.realPath ?? file.path,
-                mtimeMs: found.mtimeMs,
-              };
-              const size = await measure(io, fresh.path);
-              if (size === undefined) {
-                $.ui.toast(
-                  `imgview: not an image sips or ImageMagick can read: ${name}`,
-                );
-
-                return;
-              }
-              const mode = io.isPixelTerminal ? "pixels" : "cells";
-              let picture: Shown | undefined;
-              try {
-                picture = await oneAtATime(() =>
-                  replace($, io, fresh, size, mode),
-                );
-              } catch {
-                $.ui.toast(`imgview: could not show ${name}, try again`);
-
-                return;
-              }
-              if (picture === undefined) {
-                $.ui.toast(`imgview: could not convert to PNG: ${name}`);
-
-                return;
-              }
-              const isUp = (await $.ui.panes()).some(
-                (pane) => pane.id === PANE,
-              );
-              await $.ui.open(sized(picture, columns, isUp));
-            }}
+            onPress={() => onOpen(io, file, name, columns)}
           />
-          {isHolding && (
+          {isHolding && isInline && picture}
+          {isHolding && !isInline && (
             <Box
               position="absolute"
               top={-((card === undefined ? 1 : card.rows + 1) + 2)}
@@ -1252,23 +1440,7 @@ export const register: Register = (on) => {
               flexDirection="column"
               borderStyle="round"
             >
-              {card?.cells !== undefined && (
-                <Raster
-                  key={`imgview-thumb-${index}`}
-                  columns={card.columns}
-                  rows={card.rows}
-                  cells={card.cells}
-                />
-              )}
-              {card?.png !== undefined && (
-                <Image
-                  key={`imgview-thumb-${index}`}
-                  source={{ file: card.png, format: "png" }}
-                  columns={card.columns}
-                  rows={card.rows}
-                  alt={name}
-                />
-              )}
+              {picture}
               <Text dimColor>{caption}</Text>
             </Box>
           )}
@@ -1276,15 +1448,15 @@ export const register: Register = (on) => {
       );
       offset += label.length + 2;
     }
-    // The drawing of a reply begun last says which cards the reply draws now.
+    // The drawing of a message begun last says which cards it draws now.
     if (reply !== undefined && reply.drawing === cards) {
       reply.drawing = undefined;
       // A card it drew before and draws no longer is in use no more.
       const isLetGo = [...reply.cards].some((id) => !cards.has(id));
       reply.cards = cards;
       if (onScreen.get(e.requestId) === reply) {
-        // A reply that asked for no card (its files are missing, refused or
-        // outside) takes no place among those that did.
+        // A message that asked for no card (its files are missing, refused
+        // or have none) takes no place among those that did.
         if (isAsking) trim();
         else onScreen.delete(e.requestId);
         if (isLetGo) {
@@ -1301,10 +1473,147 @@ export const register: Register = (on) => {
     return (
       <Box flexDirection="column">
         {row}
-        <Box flexDirection="row" columnGap={2} marginLeft={2}>
+        <Box
+          flexDirection={isInline ? "column" : "row"}
+          columnGap={2}
+          marginLeft={2}
+        >
           {chips}
         </Box>
       </Box>
     );
+  }
+
+  // Under a reply that names image files: one chip a file.
+  on("ui.render", { component: "AssistantMessage" }, async ($, e, next) => {
+    const row = await next(e);
+    if (e.surface !== "terminal") return row;
+    const mentions = findImagePaths(e.props.text, MAX_CHIPS);
+    if (mentions.length === 0) {
+      leave(e.requestId);
+
+      return row;
+    }
+
+    return withChips(
+      e,
+      row,
+      $.ui.resolve(e),
+      (io, file, name, columns) =>
+        openFile($, io, file, name, columns, oneAtATime, sized),
+      async (io) => {
+      const chips: Chip[] = [];
+      for (const mention of mentions) {
+        const now = await $.clock.now();
+        // Between two working directories nothing is looked up, or
+        // remembered: asked once the clock has answered, behind which a
+        // change may have come.
+        if (io.root === undefined) break;
+        let entry = located.get(mention);
+        if (entry === undefined || now - entry.at > LOCATE_TTL_MS) {
+          const asked = boundary;
+          entry = {
+            at: now,
+            file: await locateMention(io, mention, isInline),
+          };
+          // Looked up under a working directory that has since changed.
+          if (asked !== boundary) continue;
+          located.delete(mention);
+          if (located.size >= MAX_LOCATED) {
+            for (const [key, old] of located) {
+              if (now - old.at > LOCATE_TTL_MS) located.delete(key);
+            }
+          }
+          // Still full of fresh lookups: the oldest of them goes.
+          for (const key of located.keys()) {
+            if (located.size < MAX_LOCATED) break;
+            located.delete(key);
+          }
+          located.set(mention, entry);
+        }
+        const file = entry.file;
+        if (file === undefined) continue;
+        const name = baseName(file.path);
+        const label =
+          file.isOutside === true
+            ? `▣ ${shortenPath(file.path, io.home, OUTSIDE_LABEL_MAX)}`
+            : `▣ ${name}`;
+        chips.push({ file, label, name });
+      }
+
+      return chips;
+    });
+  });
+
+  // Images pasted into a prompt are saved before the prompt goes on, while
+  // the engine still answers for their bytes. A failure is told, and the
+  // prompt goes on all the same.
+  on("prompt.submit", async ($, e, next) => {
+    const images = (e.attachments ?? []).filter(
+      (item) => item.type === "image" && item.id !== undefined,
+    );
+    if (images.length === 0 || pasteDir === undefined || sessionId === undefined)
+      return next(e);
+    const key = pasteKey(sessionId, e.text);
+    try {
+      const paths: string[] = [];
+      for (const item of images) {
+        try {
+          paths.push(await savePaste($, pasteDir, item.id!));
+        } catch (error) {
+          tellPasteFailure($, error);
+        }
+      }
+      if (paths.length > 0) {
+        const stored: Pasted = { paths, savedAt: await $.clock.now() };
+        await $.store.set(key, stored);
+        pastes.set(key, paths);
+      }
+    } catch (error) {
+      tellPasteFailure($, error);
+    }
+
+    return next(e);
+  });
+
+  // Under a prompt sent with pasted images: one chip an image.
+  on("ui.render", { component: "UserMessage" }, async ($, e, next) => {
+    const row = await next(e);
+    if (e.surface !== "terminal") return row;
+    const paths =
+      sessionId === undefined
+        ? []
+        : await pastesOf($, pastes, pasteKey(sessionId, e.props.text));
+    if (paths.length === 0) {
+      leave(e.requestId);
+
+      return row;
+    }
+
+    return withChips(
+      e,
+      row,
+      $.ui.resolve(e),
+      (io, file, name, columns) =>
+        openFile($, io, file, name, columns, oneAtATime, sized),
+      async (io) => {
+      const chips: Chip[] = [];
+      for (const [i, path] of paths.entries()) {
+        const found = await io.stat(path);
+        if (found?.kind !== "file") continue;
+        const name = `Image #${i + 1}`;
+        chips.push({
+          file: {
+            path: found.realPath ?? path,
+            mtimeMs: found.mtimeMs,
+            ...(io.canPreview ? {} : { hasNoCard: true as const }),
+          },
+          label: `▣ ${name}`,
+          name,
+        });
+      }
+
+      return chips;
+    });
   });
 };

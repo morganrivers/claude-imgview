@@ -253,6 +253,38 @@ export function isBitmapFormat(format: string | undefined): boolean {
   return format !== undefined && BITMAP_FORMATS.includes(format);
 }
 
+/** The bytes `od -An -tx1` printed: two hex digits a byte. */
+export function parseOdBytes(stdout: string): Uint8Array {
+  const words = stdout.split(/\s+/).filter((word) => word !== "");
+  if (!words.every((word) => /^[0-9a-f]{2}$/i.test(word))) return new Uint8Array();
+
+  return Uint8Array.from(words, (word) => parseInt(word, 16));
+}
+
+/**
+ * The bitmap format a file's first bytes show, named as `isBitmapFormat`
+ * names it, or undefined for anything else (SVG, PDF, PostScript, text).
+ */
+export function sniffFormat(head: Uint8Array): string | undefined {
+  const ascii = (from: number, to: number) =>
+    String.fromCharCode(...head.subarray(from, to));
+  const starts = (...bytes: number[]) =>
+    head.length >= bytes.length && bytes.every((byte, i) => head[i] === byte);
+  if (starts(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a)) return "png";
+  if (starts(0xff, 0xd8, 0xff)) return "jpeg";
+  if (ascii(0, 6) === "GIF87a" || ascii(0, 6) === "GIF89a") return "gif";
+  if (ascii(0, 4) === "RIFF" && ascii(8, 12) === "WEBP") return "webp";
+  if (starts(0x49, 0x49, 0x2a, 0x00) || starts(0x4d, 0x4d, 0x00, 0x2a))
+    return "tiff";
+  if (ascii(0, 2) === "BM" && head.length >= 14) return "bmp";
+  if (ascii(4, 8) === "ftyp" && HEIC_BRANDS.includes(ascii(8, 12)))
+    return "heic";
+
+  return undefined;
+}
+
+const HEIC_BRANDS = ["heic", "heix", "heim", "heis", "hevc", "hevx", "mif1", "msf1"];
+
 /**
  * What `sips -g format -g pixelWidth -g pixelHeight` printed, if it printed a
  * size. The format is the file's own, whatever its suffix says.
@@ -673,3 +705,29 @@ function paletteOf(root: PaletteBox, size: number): Map<number, number> {
 
   return palette;
 }
+
+/** What the store's key of a prompt's pasted images starts with. */
+export const PASTE_KEY = "paste:";
+
+/** A short hash of a text, for a store key: cyrb53, 53 bits as hex. */
+export function hashText(text: string): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c6ce57;
+  for (let i = 0; i < text.length; i++) {
+    const code = text.charCodeAt(i);
+    h1 = Math.imul(h1 ^ code, 2654435761);
+    h2 = Math.imul(h2 ^ code, 1597334677);
+  }
+  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507);
+  h1 ^= Math.imul(h2 ^ (h2 >>> 13), 3266489909);
+  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507);
+  h2 ^= Math.imul(h1 ^ (h1 >>> 13), 3266489909);
+
+  return (4294967296 * (2097151 & h2) + (h1 >>> 0)).toString(16);
+}
+
+/** The key a prompt's pasted images are stored under, in one session. */
+export function pasteKey(sessionId: string, text: string): string {
+  return `${PASTE_KEY}${hashText(`${sessionId}\n${text}`)}`;
+}
+
