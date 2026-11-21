@@ -135,6 +135,8 @@ function world(
     // What the clipboard holds: a copy of this file as a PNG, no PNG, or no
     // xclip to ask it with.
     clipboard?: { png: string } | "empty" | "no-xclip";
+    // Whether the desktop has an opener (xdg-open) to hand a file to.
+    hasOpener?: boolean;
   } = {},
 ) {
   // The engine's clock, moved by the test alone.
@@ -278,6 +280,17 @@ function world(
     runs.push([...e.argv]);
     timeouts.push(e.init?.timeoutMs);
     const tool = e.argv[0];
+    if (e.argv[0] === "/bin/sh" && e.argv[2]?.includes("xdg-open") === true) {
+      return {
+        value: {
+          exitCode: extra.hasOpener === false ? 6 : 0,
+          stdout: "",
+          stderr: "",
+          isStdoutTruncated: false,
+          isStderrTruncated: false,
+        },
+      };
+    }
     if (e.argv[0] === "/bin/sh" && e.argv[2]?.includes("xclip") === true) {
       const clip = extra.clipboard ?? "no-xclip";
       if (typeof clip === "object") copies.set(e.argv[4]!, clip.png);
@@ -3371,4 +3384,33 @@ test("draws no chip, and says nothing, when the clipboard holds no PNG", async (
   await boxIs($, "[Image #3]");
   expect(await labels(await band($))).toEqual([]);
   expect(toasts).toEqual([]);
+});
+
+const isViewerRun = (argv: readonly string[]) => argv[2]?.includes("xdg-open") === true;
+
+test("opens the pane's picture in the desktop's viewer at a press of its button", async ($, on) => {
+  const { runs, toasts } = world(on, { "shot.png": "image" }, { TERM_PROGRAM: "iTerm.app" });
+  await start($);
+  await img($, "shot.png");
+  const ui = await pane($, 40, 21);
+
+  const button = await ui.find({ type: "Button", key: "imgview-viewer" });
+  expect(button?.props).toMatchObject({ label: "open in viewer", hotkey: "o" });
+  await ui.press({ key: "imgview-viewer" });
+  expect(runs.filter(isViewerRun).map((argv) => argv[4])).toEqual(["/work/shot.png"]);
+  expect(toasts).toEqual([]);
+});
+
+test("says so in a toast when the desktop has no viewer to open the picture in", async ($, on) => {
+  const { toasts } = world(on, { "shot.png": "image" }, { TERM_PROGRAM: "iTerm.app" }, true, undefined, {
+    hasOpener: false,
+  });
+  await start($);
+  await img($, "shot.png");
+  const ui = await pane($, 40, 21);
+
+  await ui.press({ key: "imgview-viewer" });
+  expect(toasts).toEqual([
+    "imgview: could not open /work/shot.png in a viewer: no xdg-open (Linux) or open (macOS) to hand it to",
+  ]);
 });

@@ -85,6 +85,12 @@ const CLIPBOARD_PNG =
   'command -v xclip >/dev/null || exit 6; ' +
   'xclip -selection clipboard -t TARGETS -o | grep -qx image/png || exit 5; ' +
   'set -C; xclip -selection clipboard -t image/png -o >"$1"';
+// Hands $1 to the desktop's default viewer and returns at once, the viewer
+// left running on its own. Exit 6: no opener (xdg-open, or macOS's open).
+const OPEN_VIEWER =
+  'if command -v xdg-open >/dev/null; then o=xdg-open; ' +
+  'elif [ "$(uname)" = Darwin ]; then o=open; else exit 6; fi; ' +
+  'nohup "$o" "$1" >/dev/null 2>&1 </dev/null &';
 // The changes to the prompt box that are not a paste.
 const NOT_PASTES = new Set(["history", "clear", "undo", "plugin", "app"]);
 const CLIPBOARD_EXIT: Record<number, string> = {
@@ -669,6 +675,21 @@ async function captureClipboard($: EngineInterface, path: string) {
     throw new Error(
       CLIPBOARD_EXIT[done.exitCode] ?? `the shell exited ${done.exitCode}: ${done.stderr}`,
     );
+}
+
+/** Opens the file in the desktop's default image viewer, or says why not. */
+async function openInViewer($: EngineInterface, path: string) {
+  const done = await $.process.run(["/bin/sh", "-c", OPEN_VIEWER, "sh", path], {
+    timeoutMs: PREVIEW_TIMEOUT_MS,
+  });
+  if (done.exitCode === 0) return;
+  const reason =
+    done.exitCode === 6
+      ? "no xdg-open (Linux) or open (macOS) to hand it to"
+      : `the shell exited ${done.exitCode}: ${done.stderr}`;
+  const line = `imgview: could not open ${path} in a viewer: ${reason}`;
+  $.ui.log(line, { to: "debug" });
+  $.ui.toast(line);
 }
 
 /** Says, as a toast and in the debug log, why a pasted image was not kept. */
@@ -1295,11 +1316,25 @@ export const register: Register = (on, options) => {
 
       return <Text dimColor>imgview draws pictures in the terminal only.</Text>;
     }
-    const { Box, Image, Raster, Text } = $.ui.resolve(e);
+    const { Box, Button, Image, Raster, Text } = $.ui.resolve(e);
     const picture = await read($, shown);
     if (picture === null) return <Text dimColor>{USAGE}</Text>;
 
     const caption = `${picture.name} · ${picture.width}×${picture.height}`;
+    // The pane is narrow: the viewer shows the picture at full size, zoomable.
+    const footer = (
+      <Box flexDirection="row" columnGap={2}>
+        <Text dimColor>{caption}</Text>
+        <Button
+          key="imgview-viewer"
+          plain
+          dimColor
+          hotkey="o"
+          label="open in viewer"
+          onPress={() => openInViewer($, picture.path)}
+        />
+      </Box>
+    );
     const box = fit(
       picture,
       Math.min(e.props.bodyColumns, MAX_CELLS),
@@ -1319,7 +1354,7 @@ export const register: Register = (on, options) => {
             rows={box.rows}
             alt={`${caption}: no pixels on this terminal, try /img --cells`}
           />
-          <Text dimColor>{caption}</Text>
+          {footer}
         </Box>
       );
     }
@@ -1346,7 +1381,7 @@ export const register: Register = (on, options) => {
         ) : (
           <Text dimColor>Rendering…</Text>
         )}
-        <Text dimColor>{caption}</Text>
+        {footer}
       </Box>
     );
   });
