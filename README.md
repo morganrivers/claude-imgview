@@ -1,5 +1,28 @@
 # imgview
 
+## Changes in this fork
+
+This fork ([morganrivers/claude-imgview](https://github.com/morganrivers/claude-imgview)) adds the
+following to [hieuvo/claude-imgview](https://github.com/hieuvo/claude-imgview):
+
+- **Linux support.** Where `sips` is missing, previews use ImageMagick. A file is read
+  only as the format its first bytes name.
+- **Inline pictures.** The `preview` option `inline` draws a small picture under each
+  chip, which scrolls with the text.
+- **Pasted images.** An image pasted into a prompt is saved (kept 30 days) and gets a
+  chip under the sent prompt. The chip has the same number as Claude Code's
+  `[Image #N]`.
+- **Preview before sending.** An image pasted into the prompt box shows above the box
+  before you send it. This needs `xclip` (X11 only).
+- **Open in viewer.** The pane has an `o: open in viewer` button. It opens the picture
+  in the desktop's default image viewer, at full size.
+
+Install this fork:
+
+```
+/plugin install imgview --marketplace morganrivers/claude-imgview
+```
+
 Preview images without leaving Claude Code, two ways:
 
 - **Hover.** Under any reply of Claude's that names an image file, the mod draws a chip
