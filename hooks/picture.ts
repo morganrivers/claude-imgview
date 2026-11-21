@@ -731,3 +731,11 @@ export function pasteKey(sessionId: string, text: string): string {
   return `${PASTE_KEY}${hashText(`${sessionId}\n${text}`)}`;
 }
 
+
+/**
+ * The numbers Claude Code gives the images pasted into a prompt, in the order
+ * their `[Image #N]` placeholders stand in its text.
+ */
+export function pastedImageNumbers(text: string): number[] {
+  return [...text.matchAll(/\[Image #(\d+)\]/g)].map((match) => Number(match[1]));
+}

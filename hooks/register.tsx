@@ -24,6 +24,7 @@ import {
   parseOdBytes,
   pasteKey,
   parseSipsSize,
+  pastedImageNumbers,
   shortenPath,
   sniffFormat,
   tempDir,
@@ -121,6 +122,9 @@ const shown = atom({ plugin: "imgview", key: "shown" } as const, null);
 // Every temporary file the mod has made and not yet removed, by its path:
 // kept with the session, so a module loaded again knows what the last left.
 const temps = atom({ plugin: "imgview", key: "temps" } as const, []);
+// Counts saved pastes. A prompt can be drawn before its images are saved;
+// reading this while drawing makes the row draw again once they are.
+const pastesSaved = atom({ plugin: "imgview", key: "pastesSaved" } as const, 0);
 /** The engine as a hook is handed it, which the session's state is read by. */
 type Engine = Parameters<typeof read>[0];
 // How far behind the files that record is written: a drawing may write no
@@ -1568,6 +1572,7 @@ export const register: Register = (on, options) => {
         const stored: Pasted = { paths, savedAt: await $.clock.now() };
         await $.store.set(key, stored);
         pastes.set(key, paths);
+        await update($, pastesSaved, (count) => count + 1);
       }
     } catch (error) {
       tellPasteFailure($, error);
@@ -1580,6 +1585,7 @@ export const register: Register = (on, options) => {
   on("ui.render", { component: "UserMessage" }, async ($, e, next) => {
     const row = await next(e);
     if (e.surface !== "terminal") return row;
+    await read($, pastesSaved);
     const paths =
       sessionId === undefined
         ? []
@@ -1589,6 +1595,13 @@ export const register: Register = (on, options) => {
 
       return row;
     }
+    const numbers = pastedImageNumbers(e.props.text);
+    const isNumbered = numbers.length === paths.length;
+    if (!isNumbered)
+      $.ui.log(
+        `imgview: ${paths.length} saved pastes but ${numbers.length} [Image #N] in the prompt, so chips count from 1`,
+        { to: "debug" },
+      );
 
     return withChips(
       e,
@@ -1601,7 +1614,7 @@ export const register: Register = (on, options) => {
       for (const [i, path] of paths.entries()) {
         const found = await io.stat(path);
         if (found?.kind !== "file") continue;
-        const name = `Image #${i + 1}`;
+        const name = `Image #${isNumbered ? numbers[i] : i + 1}`;
         chips.push({
           file: {
             path: found.realPath ?? path,

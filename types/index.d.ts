@@ -28,6 +28,10 @@ declare module "claude-code" {
       shown: Shown | null;
       /** The temporary files the mod made and has not removed, by path. */
       temps: readonly string[];
+      /** How many prompts have had pasted images saved: a signal to draw again. */
+      pastesSaved: number;
+      /** How many prompts have had pasted images saved: a signal to draw again. */
+      pastesSaved: number;
     };
   }
 }

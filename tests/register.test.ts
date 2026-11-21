@@ -3139,6 +3139,28 @@ test(
   },
 );
 
+test(
+  "labels each pasted image's chip with the number Claude Code gave it",
+  { options: { preview: "inline" } },
+  async ($, on) => {
+    const dir = "/home/me/.claude/imgview-pastes";
+    const text = "see [Image #8] and [Image #9]";
+    world(on, { [`${dir}/a.png`]: "image", [`${dir}/b.png`]: "image" }, {}, true, undefined, {
+      store: {
+        [pasteKey("s1", text)]: {
+          paths: [`${dir}/a.png`, `${dir}/b.png`],
+          savedAt: 1_700_000_000_000,
+        },
+      },
+    });
+    await start($);
+
+    const ui = await prompt($, text);
+    const chips = await ui.findAll({ type: "Button" });
+    expect(chips.map((chip) => chip.props.label)).toEqual(["▣ Image #8", "▣ Image #9"]);
+  },
+);
+
 test("leaves a prompt as the engine drew it when it was sent with no pasted image", async ($, on) => {
   const { runs } = world(on, {});
   await start($);

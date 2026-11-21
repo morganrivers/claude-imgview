@@ -18,6 +18,7 @@ import {
   tempDir,
   toBase64,
   toCells,
+  pastedImageNumbers,
 } from "../hooks/picture";
 import type { Bitmap } from "../hooks/picture";
 
@@ -699,5 +700,17 @@ describe("previews", () => {
       expect(isBitmapFormat(format)).toBe(true);
     for (const format of ["svg", "pdf", "eps", "", undefined])
       expect(isBitmapFormat(format)).toBe(false);
+  });
+});
+
+describe("pastedImageNumbers", () => {
+  test("reads the [Image #N] placeholders in the order they stand", () => {
+    expect(pastedImageNumbers("a [Image #8] b [Image #12]")).toEqual([8, 12]);
+    expect(pastedImageNumbers("[Image #3]")).toEqual([3]);
+  });
+
+  test("finds none in text with no placeholder, or a malformed one", () => {
+    expect(pastedImageNumbers("hello")).toEqual([]);
+    expect(pastedImageNumbers("[Image #] [image #2] Image #4")).toEqual([]);
   });
 });
