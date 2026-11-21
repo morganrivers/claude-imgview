@@ -1,5 +1,12 @@
 import { expect, mock, test } from "claude-code/testing";
-import type { On, RenderElement } from "claude-code";
+import type {
+  On,
+  PromptChangeInput,
+  PromptChangeResult,
+  PromptEditInput,
+  PromptEditResult,
+  RenderElement,
+} from "claude-code";
 import type { Engine } from "claude-code/testing";
 
 import { pasteKey, toBase64 } from "../hooks/picture";
@@ -125,6 +132,9 @@ function world(
     mtimes?: Record<string, number>;
     // Links: where each of these names really lands.
     targets?: Record<string, string>;
+    // What the clipboard holds: a copy of this file as a PNG, no PNG, or no
+    // xclip to ask it with.
+    clipboard?: { png: string } | "empty" | "no-xclip";
   } = {},
 ) {
   // The engine's clock, moved by the test alone.
@@ -167,6 +177,12 @@ function world(
   const looks = new Map<string, number>();
 
   mock.store(on, extra.store ?? {});
+  on("prompt.change", (_$, e) => ({ text: e.text }));
+  // The engine's own edit: what was typed or pasted takes the selection's place.
+  on("prompt.edit", (_$, e) => ({
+    text: e.text.slice(0, e.start) + e.inputText + e.text.slice(e.end),
+    cursor: e.start + e.inputText.length,
+  }));
   on("session.id", () => ({ value: "s1" }));
   on("fs.list", (_$, e) => ({ value: (extra.listing?.[e.path] ?? []).map((entry) => ({
     ...entry,
@@ -262,6 +278,15 @@ function world(
     runs.push([...e.argv]);
     timeouts.push(e.init?.timeoutMs);
     const tool = e.argv[0];
+    if (e.argv[0] === "/bin/sh" && e.argv[2]?.includes("xclip") === true) {
+      const clip = extra.clipboard ?? "no-xclip";
+      if (typeof clip === "object") copies.set(e.argv[4]!, clip.png);
+      const exitCode = typeof clip === "object" ? 0 : clip === "empty" ? 5 : 6;
+
+      return {
+        value: { exitCode, stdout: "", stderr: "", isStdoutTruncated: false, isStderrTruncated: false },
+      };
+    }
     const isMagickRun =
       extra.isMagick === true && (tool === "magick" || tool === "od");
     if (tool === "sips" && extra.isSipsMissing === true)
@@ -3218,4 +3243,132 @@ test("lets a prompt go on, and says so, when a pasted image cannot be read", asy
   });
   expect(reached).toEqual(["look [Image #1]"]);
   expect(toasts.some((text) => text.startsWith("imgview: could not save a pasted image"))).toBe(true);
+});
+
+// The test kit raises prompt.edit and prompt.change, but its Engine type
+// (Claude Code 2.1.330) does not list them.
+const promptEvents = ($: Engine) =>
+  $.prompt as unknown as {
+    edit: (e: PromptEditInput) => Promise<PromptEditResult>;
+    change: (e: PromptChangeInput) => Promise<PromptChangeResult>;
+  };
+
+/** Leaves the prompt box holding `text`, as Claude Code does after a paste. */
+function boxIs($: Engine, text: string, kind: PromptChangeInput["origin"]["kind"] = "engine") {
+  return promptEvents($).change({
+    text,
+    cursor: text.length,
+    origin: kind === "plugin" ? { kind, name: "other" } : { kind },
+  });
+}
+
+/** Deletes everything typed into the prompt box with one key. */
+function deleteAll($: Engine, text: string) {
+  return promptEvents($).edit({
+    origin: { kind: "composer" },
+    text,
+    cursor: text.length,
+    start: 0,
+    end: text.length,
+    inputText: "",
+  });
+}
+
+/** The band above the prompt box, as the engine draws it. */
+function band($: Engine) {
+  return $.ui.mount({
+    plugin: "imgview",
+    surface: "terminal",
+    component: "AbovePrompt",
+    requestId: "above-prompt",
+    props: {
+      hasSurvey: false,
+      isCollapsed: false,
+      isWorking: false,
+      maxRows: 20,
+      bodyColumns: 120,
+      scroll: { offset: 0, bodyRows: 40 },
+      view: {},
+    },
+    viewport: { columns: 120, rows: 50, isFullscreen: true },
+  });
+}
+
+const labels = async (ui: Awaited<ReturnType<typeof band>>) =>
+  (await ui.findAll({ type: "Button" })).map((chip) => chip.props.label);
+
+const isClipboardRun = (argv: readonly string[]) => argv[2]?.includes("xclip") === true;
+
+test(
+  "shows an image pasted into the prompt box above it before the prompt is sent",
+  { options: { preview: "inline" } },
+  async ($, on) => {
+    const { runs } = world(on, { "shot.png": "image" }, {}, true, undefined, {
+      clipboard: { png: "shot.png" },
+    });
+    await start($);
+    const ui = await band($);
+    expect(await labels(ui)).toEqual([]);
+
+    await boxIs($, "look [Image #3]");
+    expect(await labels(ui)).toEqual(["▣ Image #3"]);
+    // Text typed after it takes no second copy.
+    await boxIs($, "look [Image #3] here");
+    expect(runs.filter(isClipboardRun)).toHaveLength(1);
+  },
+);
+
+test("takes no picture from the clipboard for an image a recalled prompt brings back", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" }, {}, true, undefined, {
+    clipboard: { png: "shot.png" },
+  });
+  await start($);
+
+  for (const kind of ["history", "undo", "plugin"] as const)
+    await boxIs($, `old [Image #${kind.length}]`, kind);
+  expect(await labels(await band($))).toEqual([]);
+  expect(runs.filter(isClipboardRun)).toEqual([]);
+});
+
+test("lets the pasted image's picture go when it is deleted from the prompt box", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" }, {}, true, undefined, {
+    clipboard: { png: "shot.png" },
+  });
+  await start($);
+  await boxIs($, "[Image #3]");
+  const copy = runs.find(isClipboardRun)![4]!;
+
+  await deleteAll($, "[Image #3]");
+  expect(await labels(await band($))).toEqual([]);
+  expect(runs.some((argv) => argv[0] === "rm" && argv.includes(copy))).toBe(true);
+});
+
+test("lets the pasted image's picture go when the prompt is sent", async ($, on) => {
+  on("prompt.submit", (_$, e) => ({ text: e.text }));
+  world(on, { "shot.png": "image" }, {}, true, undefined, { clipboard: { png: "shot.png" } });
+  await start($);
+  await boxIs($, "[Image #3]");
+
+  await $.prompt.submit({ text: "look [Image #3]", origin: { kind: "composer" }, wait: false });
+  expect(await labels(await band($))).toEqual([]);
+});
+
+test("says so in a toast when no xclip can read the pasted image", async ($, on) => {
+  const { toasts } = world(on, {}, {}, true, undefined, { clipboard: "no-xclip" });
+  await start($);
+
+  await boxIs($, "[Image #3]");
+  expect(await labels(await band($))).toEqual([]);
+  expect(toasts).toEqual([
+    "imgview: no preview for pasted [Image #3]: xclip is not installed, so pasted images get no preview before they are sent (X11 only)",
+  ]);
+});
+
+test("draws no chip, and says nothing, when the clipboard holds no PNG", async ($, on) => {
+  const { toasts } = world(on, {}, {}, true, undefined, { clipboard: "empty" });
+  await start($);
+
+  await boxIs($, "[Image #3]");
+  expect(await labels(await band($))).toEqual([]);
+  expect(toasts).toEqual([]);
 });

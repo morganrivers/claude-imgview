@@ -79,6 +79,18 @@ const PASTE_SUFFIX: Record<string, string> = {
 // person reads. The name is new: noclobber refuses one that is there.
 const SAVE_PASTE =
   'umask 077; mkdir -p -- "$1" && set -C && base64 -d >"$2"';
+// Writes the clipboard's PNG to $1, a new file. Exit 6: no xclip (Wayland
+// without XWayland, macOS); exit 5: the clipboard holds no PNG.
+const CLIPBOARD_PNG =
+  'command -v xclip >/dev/null || exit 6; ' +
+  'xclip -selection clipboard -t TARGETS -o | grep -qx image/png || exit 5; ' +
+  'set -C; xclip -selection clipboard -t image/png -o >"$1"';
+// The changes to the prompt box that are not a paste.
+const NOT_PASTES = new Set(["history", "clear", "undo", "plugin", "app"]);
+const CLIPBOARD_EXIT: Record<number, string> = {
+  5: "the clipboard holds no PNG",
+  6: "xclip is not installed, so pasted images get no preview before they are sent (X11 only)",
+};
 // The pixels a card's PNG is given a cell, where the terminal draws pixels.
 const CARD_CELL_PIXELS = { width: 10, height: 20 };
 // A reply is drawn again for every piece that streams in: a path is looked up
@@ -125,6 +137,10 @@ const temps = atom({ plugin: "imgview", key: "temps" } as const, []);
 // Counts saved pastes. A prompt can be drawn before its images are saved;
 // reading this while drawing makes the row draw again once they are.
 const pastesSaved = atom({ plugin: "imgview", key: "pastesSaved" } as const, 0);
+const draftsChanged = atom(
+  { plugin: "imgview", key: "draftsChanged" } as const,
+  0,
+);
 /** The engine as a hook is handed it, which the session's state is read by. */
 type Engine = Parameters<typeof read>[0];
 // How far behind the files that record is written: a drawing may write no
@@ -638,6 +654,21 @@ async function savePaste(
     throw new Error(`the shell exited ${done.exitCode}: ${done.stderr}`);
 
   return path;
+}
+
+/**
+ * Copies the clipboard's picture to `path`, a new file: Claude Code gives a
+ * pasted image to no hook before the prompt is sent, and it took this one
+ * from the clipboard. Throws with the reason when none is written.
+ */
+async function captureClipboard($: EngineInterface, path: string) {
+  const done = await $.process.run(["/bin/sh", "-c", CLIPBOARD_PNG, "sh", path], {
+    timeoutMs: PREVIEW_TIMEOUT_MS,
+  });
+  if (done.exitCode !== 0)
+    throw new Error(
+      CLIPBOARD_EXIT[done.exitCode] ?? `the shell exited ${done.exitCode}: ${done.stderr}`,
+    );
 }
 
 /** Says, as a toast and in the debug log, why a pasted image was not kept. */
@@ -1328,8 +1359,10 @@ export const register: Register = (on, options) => {
    * `inline` the picture is drawn under its chip.
    */
   async function withChips(
-    e: RenderInput<"AssistantMessage" | "UserMessage", "terminal">,
+    e: RenderInput<"AssistantMessage" | "UserMessage" | "AbovePrompt", "terminal">,
     row: RenderElement,
+    // Whether any of it is on screen; false where the surface does not say.
+    isVisible: boolean,
     elements: Elements["terminal"],
     onOpen: (
       io: Host,
@@ -1352,11 +1385,7 @@ export const register: Register = (on, options) => {
     const io = host;
     // Where the terminal does not say what is on screen, nothing is taken to
     // be: the chips are drawn, and no card is made or drawn for them.
-    const visibility = e.props.onScreen;
-    const reply =
-      visibility === undefined || visibility === null
-        ? undefined
-        : enter(e.requestId);
+    const reply = isVisible ? enter(e.requestId) : undefined;
     if (reply === undefined) leave(e.requestId);
     // The cards this drawing asks for. They are the message's own once the
     // drawing is done, and no other drawing's set is touched meanwhile.
@@ -1502,6 +1531,7 @@ export const register: Register = (on, options) => {
     return withChips(
       e,
       row,
+      e.props.onScreen !== undefined && e.props.onScreen !== null,
       $.ui.resolve(e),
       (io, file, name, columns) =>
         openFile($, io, file, name, columns, oneAtATime, sized),
@@ -1553,6 +1583,8 @@ export const register: Register = (on, options) => {
   // the engine still answers for their bytes. A failure is told, and the
   // prompt goes on all the same.
   on("prompt.submit", async ($, e, next) => {
+    // What was pasted is sent now: the band above the prompt lets it go.
+    await syncDrafts($, drafts, host, "", false);
     const images = (e.attachments ?? []).filter(
       (item) => item.type === "image" && item.id !== undefined,
     );
@@ -1606,27 +1638,154 @@ export const register: Register = (on, options) => {
     return withChips(
       e,
       row,
+      e.props.onScreen !== undefined && e.props.onScreen !== null,
       $.ui.resolve(e),
       (io, file, name, columns) =>
         openFile($, io, file, name, columns, oneAtATime, sized),
-      async (io) => {
-      const chips: Chip[] = [];
-      for (const [i, path] of paths.entries()) {
-        const found = await io.stat(path);
-        if (found?.kind !== "file") continue;
-        const name = `Image #${isNumbered ? numbers[i] : i + 1}`;
-        chips.push({
-          file: {
-            path: found.realPath ?? path,
-            mtimeMs: found.mtimeMs,
-            ...(io.canPreview ? {} : { hasNoCard: true as const }),
-          },
-          label: `▣ ${name}`,
-          name,
-        });
-      }
+      (io) =>
+        pastedChips(
+          io,
+          paths.map((path, i) => ({ path, number: isNumbered ? numbers[i]! : i + 1 })),
+        ),
+    );
+  });
 
-      return chips;
-    });
+  const drafts = new Drafts();
+
+  // Typing or deleting in the box: an image's `[Image #N]` may go with it.
+  on("prompt.edit", async ($, e, next) => {
+    const result = await next(e);
+    await syncDrafts($, drafts, host, result.text, true);
+
+    return result;
+  });
+
+  // Claude Code puts a pasted image's `[Image #N]` in the box as an `engine`
+  // change. A recalled entry, an undo or a plugin's fill brings back an
+  // `[Image #N]` whose picture is not on the clipboard: none is taken for it.
+  on("prompt.change", async ($, e, next) => {
+    const isPaste = !NOT_PASTES.has(e.origin.kind);
+    await syncDrafts($, drafts, host, e.text, isPaste);
+
+    return next(e);
+  });
+
+  // Above the prompt box: one chip and picture a pasted image not yet sent.
+  on("ui.render", { component: "AbovePrompt" }, async ($, e, next) => {
+    if (e.surface !== "terminal") return next(e);
+    await read($, draftsChanged);
+    if (drafts.pictures.size === 0 || e.props.hasSurvey) {
+      leave(e.requestId);
+
+      return next(e);
+    }
+    const row = await next(e);
+
+    return withChips(
+      e,
+      row,
+      !e.props.isCollapsed,
+      $.ui.resolve(e),
+      (io, file, name, columns) =>
+        openFile($, io, file, name, columns, oneAtATime, sized),
+      (io) =>
+        pastedChips(
+          io,
+          [...drafts.pictures].map(([number, path]) => ({ path, number })),
+        ),
+    );
   });
 };
+
+/** The pictures pasted into the prompt box and not yet sent. */
+class Drafts {
+  // Claude Code's number for each, to a copy of the clipboard taken at its
+  // paste.
+  readonly pictures = new Map<number, string>();
+  // The numbers the box held when last seen: a number new to it was pasted.
+  private held = new Set<number>();
+
+  /** Takes the box's text: the numbers new to it, and the copies it let go. */
+  look(text: string) {
+    const now = new Set(pastedImageNumbers(text));
+    const fresh = [...now].filter((n) => !this.held.has(n) && !this.pictures.has(n));
+    const gone: string[] = [];
+    for (const [number, path] of this.pictures) {
+      if (now.has(number)) continue;
+      this.pictures.delete(number);
+      gone.push(path);
+    }
+    this.held = now;
+
+    return { fresh, gone };
+  }
+
+  /** Keeps a copy taken for `number`, unless the box let it go meanwhile. */
+  keep(number: number, path: string) {
+    if (!this.held.has(number)) return false;
+    this.pictures.set(number, path);
+
+    return true;
+  }
+}
+
+/**
+ * Brings the band's pictures in line with the box's text: removes the copies
+ * of images it no longer holds and, where the change was a paste, copies the
+ * clipboard for each image new to it.
+ */
+async function syncDrafts(
+  $: EngineInterface,
+  drafts: Drafts,
+  io: Host | undefined,
+  text: string,
+  isPaste: boolean,
+) {
+  const { fresh, gone } = drafts.look(text);
+  for (const path of gone) io?.remove(path);
+  let isChanged = gone.length > 0;
+  if (isPaste && io !== undefined) {
+    for (const number of fresh) {
+      const path = io.tempPath("png");
+      io.keep(path);
+      try {
+        await captureClipboard($, path);
+      } catch (error) {
+        io.remove(path);
+        const reason = error instanceof Error ? error.message : String(error);
+        const line = `imgview: no preview for pasted [Image #${number}]: ${reason}`;
+        $.ui.log(line, { to: "debug" });
+        // A file's path pasted as text is no fault of the setup.
+        if (reason !== CLIPBOARD_EXIT[5]) $.ui.toast(line);
+        continue;
+      }
+      if (drafts.keep(number, path)) isChanged = true;
+      else io.remove(path);
+    }
+  }
+  if (isChanged) await update($, draftsChanged, (count) => count + 1);
+}
+
+/** One chip a pasted picture that is still there, named by its number. */
+async function pastedChips(
+  io: Host,
+  pictures: readonly { path: string; number: number }[],
+): Promise<Chip[]> {
+  const chips: Chip[] = [];
+  for (const { path, number } of pictures) {
+    const found = await io.stat(path);
+    if (found?.kind !== "file") continue;
+    const name = `Image #${number}`;
+    chips.push({
+      file: {
+        path: found.realPath ?? path,
+        mtimeMs: found.mtimeMs,
+        ...(io.canPreview ? {} : { hasNoCard: true as const }),
+      },
+      label: `▣ ${name}`,
+      name,
+    });
+  }
+
+  return chips;
+}

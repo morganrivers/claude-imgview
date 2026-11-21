@@ -30,8 +30,11 @@ declare module "claude-code" {
       temps: readonly string[];
       /** How many prompts have had pasted images saved: a signal to draw again. */
       pastesSaved: number;
-      /** How many prompts have had pasted images saved: a signal to draw again. */
-      pastesSaved: number;
+      /**
+       * Counts each change to the pictures pasted into the prompt box and not
+       * yet sent: a signal for the band above the prompt to draw again.
+       */
+      draftsChanged: number;
     };
   }
 }
