@@ -1,7 +1,7 @@
 {
   "name": "imgview",
   "description": "Preview images inside Claude Code: each image a reply names, and each image pasted into a prompt, gets a chip. Click a chip to open the picture in a pane. Set the preview option to show a small picture under each chip that scrolls with the text, or to pop it up when the pointer is on the chip. /img <path> opens any image. Pixels on kitty and Ghostty, colored block characters on every other terminal.",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "author": {
     "name": "hieuvo"
   },

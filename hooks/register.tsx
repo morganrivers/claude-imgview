@@ -1195,7 +1195,6 @@ export const register: Register = (on, options) => {
         { to: "debug" },
       );
     }
-    await captureDeferred($, drafts, host);
     sessionId = await $.session.id();
     pasteDir = host.home === undefined ? undefined : `${host.home}/${PASTE_DIR}`;
     pastes.clear();
@@ -1206,6 +1205,8 @@ export const register: Register = (on, options) => {
     for (const path of await read($, temps)) owned.add(path);
     forgetCards();
     await host.sweep();
+    // After the sweep, which removes every copy kept before it.
+    await captureDeferred($, drafts, host);
     await $.command.register({
       name: "img",
       description: "Preview an image in a pane",

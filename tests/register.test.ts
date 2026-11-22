@@ -294,6 +294,8 @@ function world(
     if (e.argv[0] === "/bin/sh" && e.argv[2]?.includes("xclip") === true) {
       const clip = extra.clipboard ?? "no-xclip";
       if (typeof clip === "object") copies.set(e.argv[4]!, clip.png);
+      // A copy takes about 200 ms, longer than the record of kept files waits.
+      await clock.advance(200);
       const exitCode = typeof clip === "object" ? 0 : clip === "empty" ? 5 : 6;
 
       return {
@@ -3343,7 +3345,10 @@ test(
 
     await start($);
     expect(await labels(await band($))).toEqual(["▣ Image #1"]);
-    expect(runs.filter(isClipboardRun)).toHaveLength(1);
+    const copies = runs.filter(isClipboardRun);
+    expect(copies).toHaveLength(1);
+    // The session start's sweep of old copies leaves this one alone.
+    expect(runs.some((argv) => argv[0] === "rm" && argv.includes(copies[0]![4]!))).toBe(false);
     expect(toasts).toEqual([]);
   },
 );
