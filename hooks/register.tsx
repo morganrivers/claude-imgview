@@ -133,6 +133,10 @@ const MAX_ABANDONED = 8;
 // name (it is taken, or there is no room or no directory for it), and then
 // nothing was written. A pipe or a device that sits at the name is opened as
 // it is, so what is there afterwards is looked at before it is called a copy.
+// An Image holds at most 2 MiB of bytes, here as base64.
+const MAX_IMAGE_BASE64 = Math.floor((2 * 1024 * 1024 * 4) / 3);
+// The longest edge of a pane's picture when it is sent as bytes.
+const MAX_BYTES_EDGE = 1600;
 const SNAPSHOT = 'set -C; { cat -- "$1" || exit 4; } >"$2" || exit 3';
 const SNAPSHOT_NOT_OPENED = 3;
 
@@ -189,6 +193,8 @@ type Card = Measured & {
   rows: number;
   cells?: string;
   png?: string;
+  /** The PNG's bytes, base64, where the terminal cannot read a file (Herdr). */
+  pngBytes?: string;
 };
 
 /**
@@ -281,6 +287,13 @@ type Host = {
    * themselves: not through tmux, and not across ssh.
    */
   isPixelTerminal: boolean;
+  /**
+   * Herdr draws Kitty images sent as bytes but not as file paths
+   * (herdrdev/herdr-app#302), so there a picture is handed over as bytes.
+   */
+  sendsBytes: boolean;
+  /** The bytes of the pane's PNGs, base64, by path; kept out of `$.state`. */
+  pngBytes: Map<string, string>;
   /**
    * Whether `sips` or ImageMagick is on the PATH. Without either every chip
    * is drawn with no card, as for a file outside.
@@ -484,8 +497,10 @@ async function preview(
       };
       if (await convert(host, copy, png, pixels, PREVIEW)) {
         host.keep(png);
-
-        return { ...size, ...box, png };
+        if (!host.sendsBytes) return { ...size, ...box, png };
+        const pngBytes = await readImageBytes(host, png);
+        if (pngBytes !== undefined) return { ...size, ...box, png, pngBytes };
+        host.remove(png);
       }
     }
 
@@ -493,6 +508,28 @@ async function preview(
   } finally {
     if (isCopyMine) host.remove(copy);
   }
+}
+
+/** A PNG's bytes, base64; undefined when unreadable or over the Image limit. */
+async function readImageBytes(
+  host: Host,
+  path: string,
+): Promise<string | undefined> {
+  try {
+    const base64 = await host.readBytes(path);
+    return base64.length <= MAX_IMAGE_BASE64 ? base64 : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** The picture's size for the pane when sent as bytes, never enlarged. */
+function byteSize(size: Size): Size {
+  const scale = Math.min(1, MAX_BYTES_EDGE / Math.max(size.width, size.height));
+  return {
+    width: Math.max(1, Math.round(size.width * scale)),
+    height: Math.max(1, Math.round(size.height * scale)),
+  };
 }
 
 /**
@@ -523,7 +560,21 @@ async function present(
     mtimeMs: file.mtimeMs,
     mode,
   };
-  if (mode === "pixels") {
+  if (mode === "pixels" && host.sendsBytes) {
+    // Always a PNG of the mod's own, small enough to send; blocks if it is not.
+    const out = host.tempPath("png");
+    if (!(await convert(host, file.path, out, byteSize(size)))) return undefined;
+    host.keep(out);
+    const bytes = await readImageBytes(host, out);
+    if (bytes === undefined) {
+      host.remove(out);
+      picture.mode = "cells";
+    } else {
+      host.pngBytes.set(out, bytes);
+      picture.png = out;
+      picture.isPngTemporary = true;
+    }
+  } else if (mode === "pixels") {
     // The terminal reads a PNG by its absolute path; anything else is converted.
     if (isReadablePng(file.path, size.format)) {
       picture.png = file.path;
@@ -1134,6 +1185,7 @@ export const register: Register = (on, options) => {
       isRecordDue = true;
       $.clock.after(RECORD_DELAY_MS, () => void writeRecord());
     };
+    const paneBytes = new Map<string, string>();
     host = {
       run,
       exists: (path) => $.fs.exists(path),
@@ -1155,6 +1207,7 @@ export const register: Register = (on, options) => {
       // A path is struck off once `rm` has said it is gone, and not before:
       // one that could not be removed stays written down for the next sweep.
       remove: (path) => {
+        paneBytes.delete(path);
         void run(["rm", "-f", path]).then((done) => {
           if (done?.exitCode !== 0) return;
           owned.delete(path);
@@ -1185,6 +1238,8 @@ export const register: Register = (on, options) => {
           (await $.env.get("TERM")) === "xterm-ghostty" ||
           (await $.env.get("TERM_PROGRAM"))?.toLowerCase() === "ghostty" ||
           (await $.env.get("KITTY_WINDOW_ID")) !== undefined),
+      sendsBytes: (await $.env.get("HC_TERMINAL_ID")) !== undefined,
+      pngBytes: paneBytes,
       canPreview:
         (await run(["/bin/sh", "-c", "command -v sips || command -v magick"]))
           ?.exitCode === 0,
@@ -1344,16 +1399,28 @@ export const register: Register = (on, options) => {
       Math.min(e.props.bodyColumns, MAX_CELLS),
       Math.min(e.props.scroll.bodyRows - 1, MAX_CELLS),
     );
-    if (picture.mode === "pixels" && picture.png !== undefined) {
+    const paneBytes =
+      host?.sendsBytes === true && picture.png !== undefined
+        ? host.pngBytes.get(picture.png)
+        : undefined;
+    if (
+      picture.mode === "pixels" &&
+      picture.png !== undefined &&
+      (host?.sendsBytes !== true || paneBytes !== undefined)
+    ) {
       return (
         <Box flexDirection="column">
           <Image
             key={KEY}
-            source={{
-              file: picture.png,
-              format: "png",
-              generation: Math.floor(picture.mtimeMs),
-            }}
+            source={
+              paneBytes !== undefined
+                ? { png: paneBytes }
+                : {
+                    file: picture.png,
+                    format: "png",
+                    generation: Math.floor(picture.mtimeMs),
+                  }
+            }
             columns={box.columns}
             rows={box.rows}
             alt={`${caption}: no pixels on this terminal, try /img --cells`}
@@ -1476,7 +1543,11 @@ export const register: Register = (on, options) => {
         card?.png !== undefined ? (
           <Image
             key={`imgview-thumb-${index}`}
-            source={{ file: card.png, format: "png" }}
+            source={
+              card.pngBytes !== undefined
+                ? { png: card.pngBytes }
+                : { file: card.png, format: "png" }
+            }
             columns={card.columns}
             rows={card.rows}
             alt={name}
