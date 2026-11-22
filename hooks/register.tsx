@@ -1098,6 +1098,8 @@ export const register: Register = (on, options) => {
     void drain(io);
   }
 
+  const drafts = new Drafts();
+
   on("session.start", async ($, e, next) => {
     const dir = tempDir(await $.env.get("TMPDIR"));
     let root: string | undefined;
@@ -1193,6 +1195,7 @@ export const register: Register = (on, options) => {
         { to: "debug" },
       );
     }
+    await captureDeferred($, drafts, host);
     sessionId = await $.session.id();
     pasteDir = host.home === undefined ? undefined : `${host.home}/${PASTE_DIR}`;
     pastes.clear();
@@ -1685,8 +1688,6 @@ export const register: Register = (on, options) => {
     );
   });
 
-  const drafts = new Drafts();
-
   // Typing or deleting in the box: an image's `[Image #N]` may go with it.
   on("prompt.edit", async ($, e, next) => {
     const result = await next(e);
@@ -1739,6 +1740,8 @@ class Drafts {
   readonly pictures = new Map<number, string>();
   // The numbers the box held when last seen: a number new to it was pasted.
   private held = new Set<number>();
+  // Numbers pasted before session.start bound the host: copied once it has.
+  private pending: number[] = [];
 
   /** Takes the box's text: the numbers new to it, and the copies it let go. */
   look(text: string) {
@@ -1753,6 +1756,19 @@ class Drafts {
     this.held = now;
 
     return { fresh, gone };
+  }
+
+  /** Holds numbers pasted before the host was bound, for `takePending`. */
+  defer(numbers: readonly number[]) {
+    this.pending.push(...numbers);
+  }
+
+  /** The deferred numbers the box still holds; none are deferred after. */
+  takePending() {
+    const still = this.pending.filter((n) => this.held.has(n));
+    this.pending = [];
+
+    return still;
   }
 
   /** Keeps a copy taken for `number`, unless the box let it go meanwhile. */
@@ -1779,26 +1795,58 @@ async function syncDrafts(
   const { fresh, gone } = drafts.look(text);
   for (const path of gone) io?.remove(path);
   let isChanged = gone.length > 0;
-  if (isPaste && io !== undefined) {
-    for (const number of fresh) {
-      const path = io.tempPath("png");
-      io.keep(path);
-      try {
-        await captureClipboard($, path);
-      } catch (error) {
-        io.remove(path);
-        const reason = error instanceof Error ? error.message : String(error);
-        const line = `imgview: no preview for pasted [Image #${number}]: ${reason}`;
-        $.ui.log(line, { to: "debug" });
-        // A file's path pasted as text is no fault of the setup.
-        if (reason !== CLIPBOARD_EXIT[5]) $.ui.toast(line);
-        continue;
-      }
-      if (drafts.keep(number, path)) isChanged = true;
-      else io.remove(path);
-    }
+  if (isPaste && fresh.length > 0) {
+    if (io === undefined) {
+      // Pasted while the session was still starting: copied at its end.
+      drafts.defer(fresh);
+      $.ui.log(
+        `imgview: [Image #${fresh.join("], [Image #")}] pasted before imgview was ready; its preview waits for session start`,
+        { to: "debug" },
+      );
+    } else if (await captureDrafts($, drafts, io, fresh)) isChanged = true;
   }
   if (isChanged) await update($, draftsChanged, (count) => count + 1);
+}
+
+/**
+ * Copies the clipboard once for each pasted image number, and keeps the
+ * copies the box still holds. True when one was kept. A failure is logged,
+ * and shown in a toast unless the clipboard simply held no PNG.
+ */
+async function captureDrafts(
+  $: EngineInterface,
+  drafts: Drafts,
+  io: Host,
+  numbers: readonly number[],
+) {
+  let isKept = false;
+  for (const number of numbers) {
+    const path = io.tempPath("png");
+    io.keep(path);
+    try {
+      await captureClipboard($, path);
+    } catch (error) {
+      io.remove(path);
+      const reason = error instanceof Error ? error.message : String(error);
+      const line = `imgview: no preview for pasted [Image #${number}]: ${reason}`;
+      $.ui.log(line, { to: "debug" });
+      // A file's path pasted as text is no fault of the setup.
+      if (reason !== CLIPBOARD_EXIT[5]) $.ui.toast(line);
+      continue;
+    }
+    if (drafts.keep(number, path)) isKept = true;
+    else io.remove(path);
+  }
+
+  return isKept;
+}
+
+/** Copies the images pasted before the host was bound, now that it is. */
+async function captureDeferred($: EngineInterface, drafts: Drafts, io: Host) {
+  const numbers = drafts.takePending();
+  if (numbers.length === 0) return;
+  if (await captureDrafts($, drafts, io, numbers))
+    await update($, draftsChanged, (count) => count + 1);
 }
 
 /** One chip a pasted picture that is still there, named by its number. */

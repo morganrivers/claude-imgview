@@ -3331,6 +3331,35 @@ test(
   },
 );
 
+test(
+  "shows an image pasted while the session was still starting once it has started",
+  { options: { preview: "inline" } },
+  async ($, on) => {
+    const { runs, toasts } = world(on, { "shot.png": "image" }, {}, true, undefined, {
+      clipboard: { png: "shot.png" },
+    });
+    await boxIs($, "look [Image #1]");
+    expect(runs.filter(isClipboardRun)).toEqual([]);
+
+    await start($);
+    expect(await labels(await band($))).toEqual(["▣ Image #1"]);
+    expect(runs.filter(isClipboardRun)).toHaveLength(1);
+    expect(toasts).toEqual([]);
+  },
+);
+
+test("takes no picture for an early paste that was deleted before the session started", async ($, on) => {
+  const { runs } = world(on, { "shot.png": "image" }, {}, true, undefined, {
+    clipboard: { png: "shot.png" },
+  });
+  await boxIs($, "look [Image #1]");
+  await deleteAll($, "look [Image #1]");
+
+  await start($);
+  expect(await labels(await band($))).toEqual([]);
+  expect(runs.filter(isClipboardRun)).toEqual([]);
+});
+
 test("takes no picture from the clipboard for an image a recalled prompt brings back", async ($, on) => {
   const { runs } = world(on, { "shot.png": "image" }, {}, true, undefined, {
     clipboard: { png: "shot.png" },
