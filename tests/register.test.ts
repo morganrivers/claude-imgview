@@ -3146,6 +3146,84 @@ test(
   },
 );
 
+/** The boxes that hold an inline picture's rows, drawn or not. */
+async function slots(ui: Awaited<ReturnType<typeof reply>>) {
+  return (await ui.findAll({ type: "Box" })).filter(
+    (box) => box.props.height === 12 && box.props.overflow === "hidden",
+  );
+}
+
+test(
+  "keeps an inline picture's rows on screen and off, while it converts and when it fails",
+  { options: { preview: "inline" } },
+  async ($, on) => {
+    let release = () => {};
+    const barrier = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { clock } = world(on, { "a.png": "image", "bad.png": "pdf" }, {}, true, barrier);
+    await start($);
+    const text = "a.png and bad.png";
+
+    // Converting: both chips, both rows kept, no picture yet.
+    const busy = await reply($, text);
+    expect(await busy.findAll({ type: "Button" })).toHaveLength(2);
+    expect(await slots(busy)).toHaveLength(2);
+    expect(await busy.findAll({ type: "Raster" })).toHaveLength(0);
+    expect(await busy.find({ type: "Text", text: /^Rendering…/ })).toBeDefined();
+
+    release();
+    await clock.settle();
+    await busy.unmount();
+    // Drawn: the picture, and the failed one keeps its chip and rows.
+    const drawn = await reply($, text);
+    expect(await drawn.findAll({ type: "Button" })).toHaveLength(2);
+    expect(await slots(drawn)).toHaveLength(2);
+    expect(await drawn.findAll({ type: "Raster" })).toHaveLength(1);
+    expect(await drawn.find({ type: "Text", text: /^No preview/ })).toBeDefined();
+    await drawn.unmount();
+
+    // Off screen: no picture is drawn, and the rows stay.
+    const hidden = await reply($, text, { isOffScreen: true });
+    expect(await hidden.findAll({ type: "Button" })).toHaveLength(2);
+    expect(await slots(hidden)).toHaveLength(2);
+    expect(await hidden.findAll({ type: "Raster" })).toHaveLength(0);
+    await hidden.unmount();
+
+    // Where the surface does not say what is on screen, nothing is reserved.
+    const silent = await reply($, text, { isUnreported: true });
+    expect(await silent.findAll({ type: "Button" })).toHaveLength(1);
+    expect(await slots(silent)).toHaveLength(0);
+  },
+);
+
+test(
+  "keeps an inline chip and its rows while it waits for room among the cards",
+  { options: { preview: "inline" }, timeoutMs: 20000 },
+  async ($, on) => {
+    const files: Record<string, Kind> = { "extra.png": "image" };
+    const replies: string[] = [];
+    for (let n = 0; n < 8; n++) {
+      const names = [0, 1, 2, 3].map((k) => `p${n}-${k}.png`);
+      for (const name of names) files[name] = "image";
+      replies.push(names.join(" "));
+    }
+    world(on, files);
+    await start($);
+    // 32 cards drawn, every reply on screen: all in use.
+    for (const [n, text] of replies.entries()) {
+      const ui = await reply($, text, { id: `reply-${n}` });
+      expect(await ui.findAll({ type: "Raster" })).toHaveLength(4);
+      await ui.unmount();
+    }
+
+    const waiting = await reply($, "extra.png", { id: "extra" });
+    expect(await waiting.findAll({ type: "Button" })).toHaveLength(1);
+    expect(await slots(waiting)).toHaveLength(1);
+    expect(await waiting.findAll({ type: "Raster" })).toHaveLength(0);
+  },
+);
+
 test("keeps the hover card, and no picture for a file outside, by default", async ($, on) => {
   world(on, { "a.png": "image", "/home/me/shots/b.png": "image" });
   await start($);

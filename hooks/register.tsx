@@ -775,6 +775,14 @@ async function openFile(
   await $.ui.open(sized(picture, columns, isUp));
 }
 
+/**
+ * Whether a message is on screen, from its `onScreen` prop: null when it is
+ * off screen, and undefined where the surface does not say.
+ */
+function isOnScreen(onScreen: object | null | undefined): boolean | undefined {
+  return onScreen === undefined ? undefined : onScreen !== null;
+}
+
 export const register: Register = (on, options) => {
   // `inline`: each chip's picture is drawn under it, for every file, in the
   // working directory or not. `hover`: hidden over the rows above until the
@@ -1400,8 +1408,8 @@ export const register: Register = (on, options) => {
   async function withChips(
     e: RenderInput<"AssistantMessage" | "UserMessage" | "AbovePrompt", "terminal">,
     row: RenderElement,
-    // Whether any of it is on screen; false where the surface does not say.
-    isVisible: boolean,
+    // Whether any of it is on screen; undefined where the surface does not say.
+    isOnScreen: boolean | undefined,
     elements: Elements["terminal"],
     onOpen: (
       io: Host,
@@ -1424,7 +1432,11 @@ export const register: Register = (on, options) => {
     const io = host;
     // Where the terminal does not say what is on screen, nothing is taken to
     // be: the chips are drawn, and no card is made or drawn for them.
-    const reply = isVisible ? enter(e.requestId) : undefined;
+    const reply = isOnScreen === true ? enter(e.requestId) : undefined;
+    // Inline, a picture's rows are kept whether it is drawn or not: on screen
+    // or off, converting, waiting for room or failed. A message that changed
+    // height as it scrolled in or out would move the view back to it.
+    const isReserved = isInline && isOnScreen !== undefined;
     if (reply === undefined) leave(e.requestId);
     // The cards this drawing asks for. They are the message's own once the
     // drawing is done, and no other drawing's set is touched meanwhile.
@@ -1440,26 +1452,32 @@ export const register: Register = (on, options) => {
     let isAsking = false;
     for (const { file, label, name } of found) {
       const id = `${file.path}|${file.mtimeMs}|${maxColumns}`;
-      if (failed.has(id)) continue;
+      const hasFailed = failed.has(id);
+      // A hover chip with no picture to show is left out; a reserved one
+      // stays, with its rows.
+      if (hasFailed && !isReserved) continue;
       const slot = thumbs.get(id);
       // Only the drawing begun last of a message still on screen asks for a
       // card, holds one in use, or draws one, and none does for a file
       // that has no card.
       const isHolding =
+        !hasFailed &&
         file.hasNoCard !== true &&
         reply !== undefined &&
         reply.drawing === cards &&
         onScreen.get(e.requestId) === reply;
-      if (file.hasNoCard !== true) isAsking = true;
+      if (file.hasNoCard !== true && !hasFailed) isAsking = true;
       if (isHolding) {
-        // No room among the cards on screen: this one waits, with no chip.
+        // No room among the cards on screen: this one waits, with no chip
+        // unless its rows are reserved.
         if (slot === undefined && !admitThumb(io)) {
           isStarved = true;
-          continue;
+          if (!isReserved) continue;
+        } else {
+          cards.add(id);
+          if (slot !== undefined) slot.askedAt = ++asked;
+          else sketch(io, file, id, maxColumns);
         }
-        cards.add(id);
-        if (slot !== undefined) slot.askedAt = ++asked;
-        else sketch(io, file, id, maxColumns);
       }
       const card = slot?.card;
 
@@ -1501,7 +1519,20 @@ export const register: Register = (on, options) => {
             label={label}
             onPress={() => onOpen(io, file, name, columns)}
           />
-          {isHolding && isInline && picture}
+          {isReserved && file.hasNoCard !== true && (
+            <Box
+              key={`imgview-slot-${index}`}
+              height={cardRows}
+              overflow="hidden"
+              flexDirection="column"
+            >
+              {hasFailed ? (
+                <Text dimColor>No preview</Text>
+              ) : isHolding ? (
+                (picture ?? <Text dimColor>Rendering…</Text>)
+              ) : undefined}
+            </Box>
+          )}
           {isHolding && !isInline && (
             <Box
               position="absolute"
@@ -1570,7 +1601,7 @@ export const register: Register = (on, options) => {
     return withChips(
       e,
       row,
-      e.props.onScreen !== undefined && e.props.onScreen !== null,
+      isOnScreen(e.props.onScreen),
       $.ui.resolve(e),
       (io, file, name, columns) =>
         openFile($, io, file, name, columns, oneAtATime, sized),
@@ -1677,7 +1708,7 @@ export const register: Register = (on, options) => {
     return withChips(
       e,
       row,
-      e.props.onScreen !== undefined && e.props.onScreen !== null,
+      isOnScreen(e.props.onScreen),
       $.ui.resolve(e),
       (io, file, name, columns) =>
         openFile($, io, file, name, columns, oneAtATime, sized),

@@ -8,7 +8,8 @@ following to [hieuvo/claude-imgview](https://github.com/hieuvo/claude-imgview):
 - **Linux support.** Where `sips` is missing, previews use ImageMagick. A file is read
   only as the format its first bytes name.
 - **Inline pictures.** The `preview` option `inline` draws a small picture under each
-  chip, which scrolls with the text.
+  chip, which scrolls with the text. Each picture always takes 12 rows, drawn or not, so
+  scrolling past it does not move the view back to it.
 - **Pasted images.** An image pasted into a prompt is saved (kept 30 days) and gets a
   chip under the sent prompt. The chip has the same number as Claude Code's
   `[Image #N]`.
@@ -33,7 +34,8 @@ Preview images without leaving Claude Code, two ways:
 - **Inline.** With the `preview` option set to `inline`, each chip shows a small
   picture under it instead (at most 60 by 12 cells), in the normal layout, so it scrolls
   with the text. Files outside the working directory get one too. A click still opens
-  the pane.
+  the pane. The 12 rows stay while the picture is off screen, converting, waiting for
+  room, or could not be drawn (`No preview`).
 - **Pasted images.** An image pasted into a prompt is saved as a file of the mod's own
   (`~/.claude/imgview-pastes/`, kept 30 days) and gets a chip under the prompt
   (`▣ Image #1`), with a card or an inline picture as above.
